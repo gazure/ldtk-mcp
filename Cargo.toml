@@ -1,0 +1,23 @@
+[package]
+name = "ldtk-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Model Context Protocol server for editing LDtk (.ldtk) projects so agents can generate game levels"
+license = "MIT"
+
+[[bin]]
+name = "ldtk-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "0.16", features = ["server", "transport-io", "macros", "schemars"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps JSON key ordering stable so we don't churn the whole file on save
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+jsonschema = { version = "0.46.5", default-features = false }

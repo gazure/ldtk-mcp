@@ -1,0 +1,11 @@
+edition = "2024"
+max_width = 120
+tab_spaces = 4
+reorder_imports = true
+reorder_modules = true
+remove_nested_parens = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+normalize_comments = true
+normalize_doc_attributes = true
+reorder_impl_items = true
