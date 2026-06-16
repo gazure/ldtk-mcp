@@ -372,3 +372,236 @@ fn parse_tile_rect(v: &Value) -> Option<(i64, i64, i64, i64)> {
     let g = |k: &str| v.get(k).and_then(Value::as_i64);
     Some((g("x")?, g("y")?, g("w")?, g("h")?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn project(root: Value) -> Project {
+        Project {
+            path: PathBuf::from("/tmp/test.ldtk"),
+            root,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        assert_eq!(hex_to_int("#FF8000"), Some(0xFF_8000));
+        assert_eq!(hex_to_int("FF8000"), Some(0xFF_8000));
+        assert_eq!(hex_to_int("#000000"), Some(0));
+        assert_eq!(hex_to_int("notahex"), None);
+        assert_eq!(int_to_hex(0xFF_8000), "#FF8000");
+        assert_eq!(int_to_hex(0), "#000000");
+        // High bits beyond 24 are masked off.
+        assert_eq!(int_to_hex(0xAB_FF_8000u32 as i64), "#FF8000");
+    }
+
+    #[test]
+    fn escape_string_only_backslash_and_newline() {
+        assert_eq!(escape_string("a\\b"), "a\\\\b");
+        assert_eq!(escape_string("line1\nline2"), "line1\\nline2");
+        // Tabs, quotes, and carriage returns are left untouched.
+        assert_eq!(escape_string("a\tb\"c"), "a\tb\"c");
+    }
+
+    #[test]
+    fn parse_kind_covers_known_types() {
+        assert_eq!(parse_kind("F_Int"), Some(FieldKind::Int));
+        assert_eq!(parse_kind("F_Float"), Some(FieldKind::Float));
+        assert_eq!(parse_kind("F_Bool"), Some(FieldKind::Bool));
+        assert_eq!(parse_kind("F_String"), Some(FieldKind::String));
+        assert_eq!(parse_kind("F_Text"), Some(FieldKind::Text));
+        assert_eq!(parse_kind("F_Color"), Some(FieldKind::Color));
+        assert_eq!(parse_kind("F_Point"), Some(FieldKind::Point));
+        assert_eq!(parse_kind("F_Path"), Some(FieldKind::Path));
+        assert_eq!(parse_kind("F_EntityRef"), Some(FieldKind::EntityRef));
+        assert_eq!(parse_kind("F_Tile"), Some(FieldKind::Tile));
+        assert_eq!(parse_kind("F_Enum(ItemType)"), Some(FieldKind::Enum("ItemType".into())));
+        assert_eq!(parse_kind("F_Enum(5)"), Some(FieldKind::Enum("5".into())));
+        assert_eq!(parse_kind("F_Unknown"), None);
+    }
+
+    #[test]
+    fn parse_point_variants() {
+        assert_eq!(parse_point(&json!({ "cx": 3, "cy": 7 })), Some((3, 7)));
+        assert_eq!(parse_point(&json!([3, 7])), Some((3, 7)));
+        assert_eq!(parse_point(&json!("3,7")), Some((3, 7)));
+        assert_eq!(parse_point(&json!(" 3 , 7 ")), Some((3, 7)));
+        assert_eq!(parse_point(&json!([1, 2, 3])), None);
+        assert_eq!(parse_point(&json!("nope")), None);
+    }
+
+    #[test]
+    fn parse_tile_rect_reads_all_fields() {
+        assert_eq!(
+            parse_tile_rect(&json!({ "x": 1, "y": 2, "w": 3, "h": 4 })),
+            Some((1, 2, 3, 4))
+        );
+        assert_eq!(parse_tile_rect(&json!({ "x": 1, "y": 2, "w": 3 })), None);
+    }
+
+    #[test]
+    fn parse_field_def_reads_metadata() {
+        let def = parse_field_def(&json!({
+            "identifier": "hp",
+            "type": "F_Int",
+            "__type": "Int",
+            "uid": 42,
+            "isArray": false,
+            "canBeNull": false,
+            "min": 0.0,
+            "max": 100.0,
+        }))
+        .unwrap();
+        assert_eq!(def.identifier, "hp");
+        assert_eq!(def.kind, FieldKind::Int);
+        assert_eq!(def.uid, 42);
+        assert!(!def.is_array);
+        assert!(!def.can_be_null);
+        assert_eq!(def.min, Some(0.0));
+        assert_eq!(def.max, Some(100.0));
+    }
+
+    #[test]
+    fn parse_field_def_rejects_missing_identifier_and_bad_type() {
+        assert!(parse_field_def(&json!({ "type": "F_Int" })).is_err());
+        assert!(parse_field_def(&json!({ "identifier": "x", "type": "F_Bogus" })).is_err());
+    }
+
+    fn def(identifier: &str, kind: FieldKind, type_str: &str) -> FieldDef {
+        FieldDef {
+            uid: 1,
+            identifier: identifier.into(),
+            kind,
+            is_array: false,
+            can_be_null: true,
+            type_str: type_str.into(),
+            min: None,
+            max: None,
+            tileset_uid: None,
+        }
+    }
+
+    #[test]
+    fn encode_int_clamps_to_min_max() {
+        let p = project(json!({}));
+        let mut d = def("hp", FieldKind::Int, "Int");
+        d.min = Some(0.0);
+        d.max = Some(10.0);
+        let out = p.encode_field(&d, &json!(99)).unwrap();
+        assert_eq!(out["__value"], json!(10));
+        assert_eq!(out["realEditorValues"], json!([{ "id": "V_Int", "params": [10] }]));
+        let out = p.encode_field(&d, &json!(-5)).unwrap();
+        assert_eq!(out["__value"], json!(0));
+    }
+
+    #[test]
+    fn encode_string_escapes_and_wraps() {
+        let p = project(json!({}));
+        let d = def("name", FieldKind::String, "String");
+        let out = p.encode_field(&d, &json!("a\nb")).unwrap();
+        assert_eq!(out["__value"], json!("a\\nb"));
+        assert_eq!(out["realEditorValues"], json!([{ "id": "V_String", "params": ["a\\nb"] }]));
+    }
+
+    #[test]
+    fn encode_color_accepts_hex_and_number() {
+        let p = project(json!({}));
+        let d = def("tint", FieldKind::Color, "Color");
+        let out = p.encode_field(&d, &json!("#FF8000")).unwrap();
+        assert_eq!(out["__value"], json!("#FF8000"));
+        assert_eq!(out["realEditorValues"], json!([{ "id": "V_Int", "params": [0xFF_8000] }]));
+        assert!(p.encode_field(&d, &json!("nope")).is_err());
+    }
+
+    #[test]
+    fn encode_point_emits_object_and_string() {
+        let p = project(json!({}));
+        let d = def("spot", FieldKind::Point, "Point");
+        let out = p.encode_field(&d, &json!({ "cx": 2, "cy": 3 })).unwrap();
+        assert_eq!(out["__value"], json!({ "cx": 2, "cy": 3 }));
+        assert_eq!(out["realEditorValues"], json!([{ "id": "V_String", "params": ["2,3"] }]));
+    }
+
+    #[test]
+    fn encode_enum_validates_against_defs() {
+        let p = project(json!({
+            "defs": {
+                "enums": [{
+                    "identifier": "ItemType",
+                    "uid": 5,
+                    "values": [{ "id": "Gold" }, { "id": "Trout" }],
+                }],
+            },
+        }));
+        let d = def("kind", FieldKind::Enum("ItemType".into()), "ItemType");
+        assert!(p.encode_field(&d, &json!("Gold")).is_ok());
+        // Resolution by uid (as stored in the internal `type` field) also works.
+        let d_uid = def("kind", FieldKind::Enum("5".into()), "ItemType");
+        assert!(p.encode_field(&d_uid, &json!("Trout")).is_ok());
+        let err = p.encode_field(&d, &json!("Diamond")).unwrap_err();
+        assert!(err.contains("not a value of enum"), "{err}");
+    }
+
+    #[test]
+    fn encode_array_field_requires_array() {
+        let p = project(json!({}));
+        let mut d = def("content", FieldKind::String, "Array<String>");
+        d.is_array = true;
+        let out = p.encode_field(&d, &json!(["Gold", "Trout"])).unwrap();
+        assert_eq!(out["__value"], json!(["Gold", "Trout"]));
+        assert_eq!(out["realEditorValues"].as_array().unwrap().len(), 2);
+        assert!(p.encode_field(&d, &json!("Gold")).is_err());
+    }
+
+    #[test]
+    fn encode_null_respects_can_be_null() {
+        let p = project(json!({}));
+        let mut d = def("name", FieldKind::String, "String");
+        d.can_be_null = true;
+        let out = p.encode_field(&d, &Value::Null).unwrap();
+        assert_eq!(out["__value"], Value::Null);
+        d.can_be_null = false;
+        assert!(p.encode_field(&d, &Value::Null).is_err());
+    }
+
+    #[test]
+    fn resolve_entity_ref_finds_instance_in_world() {
+        let p = project(json!({
+            "iid": "proj-iid",
+            "worlds": [{
+                "iid": "world-1",
+                "levels": [{
+                    "iid": "level-1",
+                    "layerInstances": [{
+                        "iid": "layer-1",
+                        "entityInstances": [{ "iid": "ent-1" }],
+                    }],
+                }],
+            }],
+        }));
+        let info = p.resolve_entity_ref("ent-1").expect("ref resolved");
+        assert_eq!(info.world_iid, "world-1");
+        assert_eq!(info.level_iid, "level-1");
+        assert_eq!(info.layer_iid, "layer-1");
+        assert!(p.resolve_entity_ref("missing").is_none());
+    }
+
+    #[test]
+    fn entity_field_def_lookup() {
+        let p = project(json!({
+            "defs": {
+                "entities": [{
+                    "identifier": "Chest",
+                    "fieldDefs": [{ "identifier": "requireKey", "type": "F_Bool", "__type": "Bool" }],
+                }],
+            },
+        }));
+        let d = p.entity_field_def("Chest", "requireKey").unwrap();
+        assert_eq!(d.kind, FieldKind::Bool);
+        assert!(p.entity_field_def("Chest", "missing").is_err());
+        assert!(p.entity_field_def("NoSuchEntity", "requireKey").is_err());
+    }
+}

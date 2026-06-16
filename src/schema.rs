@@ -38,3 +38,28 @@ pub fn schema_version() -> String {
         .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from))
         .unwrap_or_else(|| "?".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn schema_compiles() {
+        // If the bundled schema fails to compile, every validate call would error.
+        assert!(validator().is_ok(), "bundled schema failed to compile: {:?}", validator());
+    }
+
+    #[test]
+    fn schema_version_is_non_placeholder() {
+        let v = schema_version();
+        assert_ne!(v, "?", "expected a real version string from the bundled schema");
+    }
+
+    #[test]
+    fn validate_returns_warnings_list() {
+        // The schema is loose, so we only assert the call succeeds and returns a Vec.
+        let warns = validate(&json!({})).expect("validation should run");
+        let _ = warns.len();
+    }
+}

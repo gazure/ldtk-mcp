@@ -670,3 +670,217 @@ fn rng_seed() -> i64 {
         .unwrap_or(0);
     (nanos % 9_999_999) as i64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(root: Value) -> Project {
+        Project {
+            path: PathBuf::from("/tmp/test.ldtk"),
+            root,
+            dirty: false,
+        }
+    }
+
+    fn sample_defs() -> Value {
+        json!({
+            "nextUid": 100,
+            "worldLayout": "Free",
+            "defs": {
+                "layers": [
+                    { "uid": 1, "identifier": "Collisions", "__type": "IntGrid", "gridSize": 16,
+                      "autoTilesetDefUid": 9 },
+                    { "uid": 2, "identifier": "Entities", "__type": "Entities", "gridSize": 16 },
+                ],
+                "entities": [
+                    { "uid": 3, "identifier": "Chest", "width": 24, "height": 24,
+                      "pivotX": 0.5, "pivotY": 1.0, "color": "#FF0000", "tags": ["loot"] },
+                ],
+                "tilesets": [
+                    { "uid": 9, "identifier": "Tiles", "relPath": "tiles.png",
+                      "tileGridSize": 16, "padding": 1, "spacing": 2, "__cWid": 4 },
+                ],
+            },
+            "levels": [],
+        })
+    }
+
+    #[test]
+    fn layer_defs_parsed() {
+        let p = project(sample_defs());
+        let defs = p.layer_defs();
+        assert_eq!(defs.len(), 2);
+        let intgrid = &defs[0];
+        assert_eq!(intgrid.identifier, "Collisions");
+        assert_eq!(intgrid.kind, "IntGrid");
+        assert_eq!(intgrid.grid_size, 16);
+        // Auto tileset is preferred when present.
+        assert_eq!(intgrid.tileset_def_uid, Some(9));
+    }
+
+    #[test]
+    fn entity_defs_parsed() {
+        let p = project(sample_defs());
+        let defs = p.entity_defs();
+        assert_eq!(defs.len(), 1);
+        let chest = &defs[0];
+        assert_eq!(chest.identifier, "Chest");
+        assert_eq!(chest.width, 24);
+        assert_eq!(chest.pivot_y, 1.0);
+        assert_eq!(chest.tags, vec!["loot".to_string()]);
+    }
+
+    #[test]
+    fn tile_src_uses_tileset_geometry() {
+        let p = project(sample_defs());
+        // c_wid = 4, tile_grid_size = 16, padding = 1, spacing = 2.
+        // tile 0 -> col 0,row 0 -> (1, 1)
+        assert_eq!(p.tile_src(9, 0), Some([1, 1]));
+        // tile 5 -> col 1,row 1 -> padding + col*(16+2) = 1+18 = 19
+        assert_eq!(p.tile_src(9, 5), Some([19, 19]));
+        assert_eq!(p.tile_src(404, 0), None);
+    }
+
+    #[test]
+    fn tileset_rel_path_lookup() {
+        let p = project(sample_defs());
+        assert_eq!(p.tileset_rel_path(9), Some("tiles.png".to_string()));
+        assert_eq!(p.tileset_rel_path(0), None);
+    }
+
+    #[test]
+    fn level_matches_by_identifier_iid_uid() {
+        let lvl = json!({ "identifier": "Cave_01", "iid": "abc-123", "uid": 7 });
+        assert!(level_matches(&lvl, "Cave_01"));
+        assert!(level_matches(&lvl, "abc-123"));
+        assert!(level_matches(&lvl, "7"));
+        assert!(!level_matches(&lvl, "nope"));
+    }
+
+    #[test]
+    fn alloc_uid_bumps_next_uid() {
+        let mut p = project(sample_defs());
+        assert_eq!(p.alloc_uid().unwrap(), 100);
+        assert_eq!(p.alloc_uid().unwrap(), 101);
+        assert_eq!(p.root.get("nextUid").and_then(Value::as_i64), Some(102));
+    }
+
+    #[test]
+    fn find_level_and_refs_across_root_and_worlds() {
+        let p = project(json!({
+            "levels": [{ "identifier": "Root_A", "uid": 1 }],
+            "worlds": [{
+                "iid": "w1",
+                "levels": [{ "identifier": "World_A", "uid": 2 }],
+            }],
+        }));
+        assert_eq!(p.all_level_refs(), vec![LevelRef::Root(0), LevelRef::World(0, 0)]);
+        assert_eq!(p.find_level("Root_A"), Some(LevelRef::Root(0)));
+        assert_eq!(p.find_level("World_A"), Some(LevelRef::World(0, 0)));
+        assert_eq!(p.find_level("missing"), None);
+    }
+
+    #[test]
+    fn levels_falls_back_to_worlds_when_root_empty() {
+        let p = project(json!({
+            "levels": [],
+            "worlds": [{ "levels": [{ "identifier": "W1" }, { "identifier": "W2" }] }],
+        }));
+        let ids: Vec<&str> = p
+            .levels()
+            .iter()
+            .filter_map(|l| l.get("identifier").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["W1", "W2"]);
+    }
+
+    #[test]
+    fn create_level_appends_and_builds_layer_instances() {
+        let mut p = project(sample_defs());
+        let level = p.create_level("Cave_01", 256, 128).unwrap();
+        assert_eq!(level.get("identifier").and_then(Value::as_str), Some("Cave_01"));
+        assert_eq!(level.get("pxWid").and_then(Value::as_i64), Some(256));
+        assert!(p.dirty);
+
+        let instances = level.get("layerInstances").and_then(Value::as_array).unwrap();
+        assert_eq!(instances.len(), 2);
+        let intgrid = instances
+            .iter()
+            .find(|li| li.get("__identifier").and_then(Value::as_str) == Some("Collisions"))
+            .unwrap();
+        // 256/16 = 16 wide, 128/16 = 8 high -> 128 cells, all zero.
+        let csv = intgrid.get("intGridCsv").and_then(Value::as_array).unwrap();
+        assert_eq!(csv.len(), 16 * 8);
+        assert!(csv.iter().all(|v| v.as_i64() == Some(0)));
+
+        // It is now findable.
+        assert!(p.find_level("Cave_01").is_some());
+    }
+
+    #[test]
+    fn create_level_rejects_duplicate_identifier() {
+        let mut p = project(sample_defs());
+        p.create_level("Cave_01", 256, 256).unwrap();
+        let err = p.create_level("Cave_01", 256, 256).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn create_level_targets_first_world_when_root_empty() {
+        let mut p = project(json!({
+            "nextUid": 1,
+            "levels": [],
+            "worlds": [{ "iid": "w1", "worldLayout": "Free", "levels": [] }],
+            "defs": { "layers": [], "entities": [], "tilesets": [] },
+        }));
+        p.create_level("W_Level", 128, 128).unwrap();
+        assert_eq!(p.find_level("W_Level"), Some(LevelRef::World(0, 0)));
+    }
+
+    #[test]
+    fn next_world_position_places_to_right_in_free_layout() {
+        let p = project(json!({
+            "worldLayout": "Free",
+            "levels": [{ "worldX": 0, "pxWid": 256, "pxHei": 256 }],
+        }));
+        // Right-most edge is 256, plus a 16px gap.
+        assert_eq!(p.next_world_position(256, "Free"), (256 + 16, 0));
+    }
+
+    #[test]
+    fn next_world_position_linear_uses_sentinel() {
+        let p = project(json!({ "levels": [] }));
+        assert_eq!(p.next_world_position(256, "LinearHorizontal"), (-1, -1));
+        assert_eq!(p.next_world_position(256, "LinearVertical"), (-1, -1));
+    }
+
+    #[test]
+    fn null_external_layer_instances_nulls_only_external() {
+        let mut root = json!({
+            "levels": [
+                { "identifier": "Embedded", "layerInstances": [{ "iid": "a" }] },
+                { "identifier": "External", "externalRelPath": "External.ldtkl",
+                  "layerInstances": [{ "iid": "b" }] },
+            ],
+        });
+        null_external_layer_instances(&mut root);
+        let levels = root.get("levels").and_then(Value::as_array).unwrap();
+        assert!(!levels[0].get("layerInstances").unwrap().is_null());
+        assert!(levels[1].get("layerInstances").unwrap().is_null());
+    }
+
+    #[test]
+    fn layer_instance_ref_matches_identifier_or_iid() {
+        let p = project(json!({
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [{ "__identifier": "Collisions", "iid": "layer-iid" }],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        assert!(p.layer_instance_ref(r, "Collisions").is_some());
+        assert!(p.layer_instance_ref(r, "layer-iid").is_some());
+        assert!(p.layer_instance_ref(r, "nope").is_none());
+    }
+}

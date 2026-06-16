@@ -76,14 +76,21 @@ Add to `~/.cursor/mcp.json` (or a project `.cursor/mcp.json`):
   and rewritten on `save_project` (each `.ldtkl` gets the full level body; the main file keeps the
   stub with `layerInstances: null`).
 
-## Smoke test
+## Tests
+
+Unit tests cover the pure logic (typed-field encoding, project tree manipulation, schema loading):
+
+```bash
+cargo test
+```
+
+The end-to-end smoke test drives the server over stdio against the bundled samples and asserts
+typed entity fields, tile painting, separate-level-file round-trips, and multi-world editing all
+work:
 
 ```bash
 python3 smoke_test.py
 ```
-
-Drives the server over stdio against the bundled samples and asserts typed entity fields, tile
-painting, separate-level-file round-trips, and multi-world editing all work.
 
 ## Current limitations
 
