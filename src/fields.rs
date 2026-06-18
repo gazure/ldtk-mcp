@@ -375,8 +375,9 @@ fn parse_tile_rect(v: &Value) -> Option<(i64, i64, i64, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     fn project(root: Value) -> Project {
         Project {
