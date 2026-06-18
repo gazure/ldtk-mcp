@@ -312,6 +312,40 @@ pub struct SetWorldLayoutArgs {
     pub world_grid_height: Option<i64>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct MoveEntityArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// Instance iid of the entity to move.
+    pub entity_iid: String,
+    /// New grid X (column).
+    pub cx: i64,
+    /// New grid Y (row).
+    pub cy: i64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DeleteEntityArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// Instance iid of the entity to delete.
+    pub entity_iid: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FloodFillIntGridArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// IntGrid layer identifier or iid.
+    pub layer: String,
+    /// Start grid X (column).
+    pub cx: i64,
+    /// Start grid Y (row).
+    pub cy: i64,
+    /// IntGrid value to fill the contiguous region with.
+    pub value: i64,
+}
+
 // ---- Tool implementations --------------------------------------------------
 
 #[tool_router]
@@ -770,6 +804,56 @@ impl LdtkServer {
             )
             .map_err(|e| err(format!("{e:#}")))?;
             Ok(format!("Updated world '{}'. Call save_project to persist.", args.world))
+        })
+    }
+
+    #[tool(
+        description = "Move an existing entity instance (by iid) to a new grid cell. Pixel position is recomputed from the entity definition pivot."
+    )]
+    fn move_entity(&self, Parameters(args): Parameters<MoveEntityArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let idx = p
+                .find_level(&args.level)
+                .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
+            p.move_entity(idx, &args.entity_iid, args.cx, args.cy)
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Moved entity '{}' to ({}, {}). Call save_project to persist.",
+                args.entity_iid, args.cx, args.cy
+            ))
+        })
+    }
+
+    #[tool(description = "Delete a single entity instance (by iid) from a level.")]
+    fn delete_entity(&self, Parameters(args): Parameters<DeleteEntityArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let idx = p
+                .find_level(&args.level)
+                .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
+            p.delete_entity(idx, &args.entity_iid)
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Deleted entity '{}' from level '{}'. Call save_project to persist.",
+                args.entity_iid, args.level
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Flood fill an IntGrid layer (4-connected) from a start cell, replacing the contiguous region that shares the start cell's value. AutoLayer tiles are cleared so LDtk regenerates them."
+    )]
+    fn flood_fill_intgrid(&self, Parameters(args): Parameters<FloodFillIntGridArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let idx = p
+                .find_level(&args.level)
+                .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
+            let filled = p
+                .flood_fill_intgrid(idx, &args.layer, args.cx, args.cy, args.value)
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Flood filled {} cell(s) on '{}' from ({}, {}) with value {}. Call save_project to persist.",
+                filled, args.layer, args.cx, args.cy, args.value
+            ))
         })
     }
 
