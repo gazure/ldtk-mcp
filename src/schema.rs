@@ -47,7 +47,11 @@ mod tests {
     #[test]
     fn schema_compiles() {
         // If the bundled schema fails to compile, every validate call would error.
-        assert!(validator().is_ok(), "bundled schema failed to compile: {:?}", validator());
+        assert!(
+            validator().is_ok(),
+            "bundled schema failed to compile: {:?}",
+            validator()
+        );
     }
 
     #[test]

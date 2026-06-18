@@ -14,6 +14,8 @@ pub struct Project {
     pub path: PathBuf,
     pub root: Value,
     pub dirty: bool,
+    /// Relative `.ldtkl` paths whose levels were deleted in memory; unlinked on `save`.
+    pub pending_external_deletes: Vec<String>,
 }
 
 /// Resolved info about a layer definition, used when building layer instances.
@@ -68,6 +70,7 @@ impl Project {
             path,
             root,
             dirty: false,
+            pending_external_deletes: Vec::new(),
         };
         proj.merge_external_levels()?;
         Ok(proj)
@@ -155,6 +158,13 @@ impl Project {
         } else {
             std::fs::write(&self.path, to_text(&self.root)?)
                 .with_context(|| format!("writing {}", self.path.display()))?;
+        }
+        // Remove .ldtkl bodies for levels deleted in memory (best-effort; ignore missing).
+        if !self.pending_external_deletes.is_empty() {
+            let dir = self.project_dir();
+            for rel in self.pending_external_deletes.drain(..) {
+                std::fs::remove_file(dir.join(&rel)).ok();
+            }
         }
         self.dirty = false;
         Ok(())
@@ -369,6 +379,61 @@ impl Project {
         })
     }
 
+    /// All layer instances of type `Entities` within a level.
+    pub fn entity_layer_instances(&self, r: LevelRef) -> Vec<&Value> {
+        self.level_ref(r)
+            .and_then(|lvl| lvl.get("layerInstances"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter(|li| li.get("__type").and_then(Value::as_str) == Some("Entities"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Immutable access to an entity instance located anywhere in a level.
+    pub fn entity_instance_ref(&self, r: LevelRef, entity_iid: &str) -> Option<&Value> {
+        for li in self.level_ref(r)?.get("layerInstances")?.as_array()? {
+            if let Some(ents) = li.get("entityInstances").and_then(Value::as_array) {
+                if let Some(e) = ents
+                    .iter()
+                    .find(|e| e.get("iid").and_then(Value::as_str) == Some(entity_iid))
+                {
+                    return Some(e);
+                }
+            }
+        }
+        None
+    }
+
+    /// The `intGridValues` array from the layer definition matching `layer_id`
+    /// (by `identifier`), describing what each IntGrid number means.
+    pub fn intgrid_value_defs(&self, layer_id: &str) -> Vec<Value> {
+        self.defs()
+            .and_then(|d| d.get("layers"))
+            .and_then(Value::as_array)
+            .and_then(|layers| {
+                layers
+                    .iter()
+                    .find(|l| l.get("identifier").and_then(Value::as_str) == Some(layer_id))
+            })
+            .and_then(|l| l.get("intGridValues"))
+            .and_then(Value::as_array)
+            .map(|vals| {
+                vals.iter()
+                    .map(|v| {
+                        json!({
+                            "value": v.get("value"),
+                            "identifier": v.get("identifier"),
+                            "color": v.get("color"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Build an empty layer instance for a given layer def and level dimensions.
     fn empty_layer_instance(&self, def: &LayerDef, level_uid: i64, px_wid: i64, px_hei: i64) -> Value {
         let c_wid = (px_wid as f64 / def.grid_size as f64).ceil() as i64;
@@ -554,6 +619,281 @@ impl Project {
         }
     }
 
+    /// The world layout governing a level's container (root project or its world).
+    fn layout_for(&self, r: LevelRef) -> String {
+        match r {
+            LevelRef::Root(_) => self.world_layout(),
+            LevelRef::World(w, _) => self
+                .root
+                .get("worlds")
+                .and_then(Value::as_array)
+                .and_then(|ws| ws.get(w))
+                .and_then(|wv| wv.get("worldLayout"))
+                .and_then(Value::as_str)
+                .unwrap_or("Free")
+                .to_string(),
+        }
+    }
+
+    /// Append a level into the same container (root or world) that `r` points into.
+    fn push_level(&mut self, r: LevelRef, level: Value) -> Result<()> {
+        match r {
+            LevelRef::Root(_) => {
+                self.root
+                    .get_mut("levels")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| anyhow!("no `levels` array"))?
+                    .push(level);
+            }
+            LevelRef::World(w, _) => {
+                self.root
+                    .get_mut("worlds")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|ws| ws.get_mut(w))
+                    .and_then(|wv| wv.get_mut("levels"))
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| anyhow!("world has no `levels` array"))?
+                    .push(level);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop any `__neighbours` entries pointing at a removed level iid, across all levels.
+    fn remove_neighbour_refs(&mut self, iid: &str) {
+        fn strip(levels: &mut Value, iid: &str) {
+            if let Some(arr) = levels.as_array_mut() {
+                for lvl in arr {
+                    if let Some(ns) = lvl.get_mut("__neighbours").and_then(Value::as_array_mut) {
+                        ns.retain(|n| n.get("levelIid").and_then(Value::as_str) != Some(iid));
+                    }
+                }
+            }
+        }
+        if let Some(levels) = self.root.get_mut("levels") {
+            strip(levels, iid);
+        }
+        if let Some(worlds) = self.root.get_mut("worlds").and_then(Value::as_array_mut) {
+            for w in worlds {
+                if let Some(levels) = w.get_mut("levels") {
+                    strip(levels, iid);
+                }
+            }
+        }
+    }
+
+    /// Delete a level by identifier/iid/uid. Returns the deleted level's iid.
+    /// For external-level projects, the `.ldtkl` body is unlinked on the next `save`.
+    pub fn delete_level(&mut self, key: &str) -> Result<String> {
+        let r = self.find_level(key).ok_or_else(|| anyhow!("level '{key}' not found"))?;
+        let (iid, ext_rel) = {
+            let lvl = self.level_ref(r).unwrap();
+            (
+                lvl.get("iid").and_then(Value::as_str).unwrap_or("").to_string(),
+                lvl.get("externalRelPath").and_then(Value::as_str).map(String::from),
+            )
+        };
+        match r {
+            LevelRef::Root(i) => {
+                self.root
+                    .get_mut("levels")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| anyhow!("no `levels` array"))?
+                    .remove(i);
+            }
+            LevelRef::World(w, i) => {
+                self.root
+                    .get_mut("worlds")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|ws| ws.get_mut(w))
+                    .and_then(|wv| wv.get_mut("levels"))
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| anyhow!("world has no `levels` array"))?
+                    .remove(i);
+            }
+        }
+        if self.external_levels() {
+            if let Some(rel) = ext_rel {
+                self.pending_external_deletes.push(rel);
+            }
+        }
+        if !iid.is_empty() {
+            self.remove_neighbour_refs(&iid);
+        }
+        self.dirty = true;
+        Ok(iid)
+    }
+
+    /// Duplicate a level into the same container, with fresh uid/iid(s) and a free position.
+    pub fn duplicate_level(&mut self, src_key: &str, identifier: Option<&str>) -> Result<Value> {
+        let r = self
+            .find_level(src_key)
+            .ok_or_else(|| anyhow!("level '{src_key}' not found"))?;
+        let src_id = self
+            .level_ref(r)
+            .unwrap()
+            .get("identifier")
+            .and_then(Value::as_str)
+            .unwrap_or("Level")
+            .to_string();
+        let new_id = match identifier {
+            Some(s) => {
+                if self.find_level(s).is_some() {
+                    bail!("a level named '{s}' already exists");
+                }
+                s.to_string()
+            }
+            None => {
+                let mut candidate = format!("{src_id}_copy");
+                let mut n = 2;
+                while self.find_level(&candidate).is_some() {
+                    candidate = format!("{src_id}_copy{n}");
+                    n += 1;
+                }
+                candidate
+            }
+        };
+        let layout = self.layout_for(r);
+        let px_wid = self
+            .level_ref(r)
+            .unwrap()
+            .get("pxWid")
+            .and_then(Value::as_i64)
+            .unwrap_or(256);
+        let (world_x, world_y) = self.next_world_position(px_wid, &layout);
+        let new_uid = self.alloc_uid()?;
+
+        let mut lvl = self.level_ref(r).unwrap().clone();
+        lvl["identifier"] = json!(new_id);
+        lvl["iid"] = json!(Self::new_iid());
+        lvl["uid"] = json!(new_uid);
+        lvl["worldX"] = json!(world_x);
+        lvl["worldY"] = json!(world_y);
+        lvl["__neighbours"] = json!([]);
+        lvl["externalRelPath"] = Value::Null;
+        if let Some(insts) = lvl.get_mut("layerInstances").and_then(Value::as_array_mut) {
+            for li in insts {
+                li["iid"] = json!(Self::new_iid());
+                li["levelId"] = json!(new_uid);
+            }
+        }
+        self.push_level(r, lvl.clone())?;
+        self.dirty = true;
+        Ok(lvl)
+    }
+
+    /// Set a level's world-space pixel position.
+    pub fn move_level(&mut self, key: &str, world_x: i64, world_y: i64) -> Result<()> {
+        let r = self.find_level(key).ok_or_else(|| anyhow!("level '{key}' not found"))?;
+        let lvl = self.level_value_mut(r)?;
+        lvl["worldX"] = json!(world_x);
+        lvl["worldY"] = json!(world_y);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Resize a level, reflowing every layer instance and clipping out-of-bounds content.
+    pub fn resize_level(&mut self, key: &str, px_wid: i64, px_hei: i64) -> Result<()> {
+        if px_wid <= 0 || px_hei <= 0 {
+            bail!("level dimensions must be positive (got {px_wid}x{px_hei})");
+        }
+        let r = self.find_level(key).ok_or_else(|| anyhow!("level '{key}' not found"))?;
+        let lvl = self.level_value_mut(r)?;
+        lvl["pxWid"] = json!(px_wid);
+        lvl["pxHei"] = json!(px_hei);
+        if let Some(insts) = lvl.get_mut("layerInstances").and_then(Value::as_array_mut) {
+            for li in insts {
+                resize_layer_instance(li, px_wid, px_hei);
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Find a world index by `identifier` or `iid`.
+    pub fn find_world(&self, key: &str) -> Option<usize> {
+        self.root.get("worlds").and_then(Value::as_array)?.iter().position(|w| {
+            w.get("identifier").and_then(Value::as_str) == Some(key)
+                || w.get("iid").and_then(Value::as_str) == Some(key)
+        })
+    }
+
+    /// Append a new (empty) world to the root `worlds` array, creating the array if needed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_world(
+        &mut self,
+        identifier: &str,
+        world_layout: Option<&str>,
+        world_grid_width: Option<i64>,
+        world_grid_height: Option<i64>,
+        default_level_width: Option<i64>,
+        default_level_height: Option<i64>,
+    ) -> Result<Value> {
+        if self.find_world(identifier).is_some() {
+            bail!("a world named '{identifier}' already exists");
+        }
+        let layout = world_layout.unwrap_or("Free");
+        let default_w = default_level_width
+            .or_else(|| self.root.get("defaultLevelWidth").and_then(Value::as_i64))
+            .unwrap_or(256);
+        let default_h = default_level_height
+            .or_else(|| self.root.get("defaultLevelHeight").and_then(Value::as_i64))
+            .unwrap_or(256);
+        let world = json!({
+            "iid": Self::new_iid(),
+            "identifier": identifier,
+            "worldLayout": layout,
+            "worldGridWidth": world_grid_width.unwrap_or(256),
+            "worldGridHeight": world_grid_height.unwrap_or(256),
+            "defaultLevelWidth": default_w,
+            "defaultLevelHeight": default_h,
+            "levels": [],
+        });
+        let obj = self
+            .root
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("root is not an object"))?;
+        if !obj.get("worlds").map(Value::is_array).unwrap_or(false) {
+            obj.insert("worlds".into(), json!([]));
+        }
+        obj.get_mut("worlds")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .push(world.clone());
+        self.dirty = true;
+        Ok(world)
+    }
+
+    /// Update a world's layout and/or grid dimensions.
+    pub fn set_world_layout(
+        &mut self,
+        world_key: &str,
+        world_layout: Option<&str>,
+        world_grid_width: Option<i64>,
+        world_grid_height: Option<i64>,
+    ) -> Result<()> {
+        let idx = self
+            .find_world(world_key)
+            .ok_or_else(|| anyhow!("world '{world_key}' not found"))?;
+        let world = self
+            .root
+            .get_mut("worlds")
+            .and_then(Value::as_array_mut)
+            .and_then(|ws| ws.get_mut(idx))
+            .ok_or_else(|| anyhow!("world index out of range"))?;
+        if let Some(layout) = world_layout {
+            world["worldLayout"] = json!(layout);
+        }
+        if let Some(gw) = world_grid_width {
+            world["worldGridWidth"] = json!(gw);
+        }
+        if let Some(gh) = world_grid_height {
+            world["worldGridHeight"] = json!(gh);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Mutable access to a level object by location.
     pub fn level_value_mut(&mut self, r: LevelRef) -> Result<&mut Value> {
         match r {
@@ -661,6 +1001,87 @@ fn null_external_layer_instances(root: &mut Value) {
     }
 }
 
+/// Reflow a single layer instance to new level pixel dimensions, clipping content that
+/// falls outside the new bounds.
+fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
+    let grid = li.get("__gridSize").and_then(Value::as_i64).unwrap_or(16).max(1);
+    let old_cw = li.get("__cWid").and_then(Value::as_i64).unwrap_or(0);
+    let old_ch = li.get("__cHei").and_then(Value::as_i64).unwrap_or(0);
+    let new_cw = ((px_wid as f64 / grid as f64).ceil() as i64).max(0);
+    let new_ch = ((px_hei as f64 / grid as f64).ceil() as i64).max(0);
+    let kind = li.get("__type").and_then(Value::as_str).unwrap_or("").to_string();
+
+    // IntGrid: rebuild the CSV, preserving the overlapping top-left region; clear the
+    // generated AutoLayer tiles so LDtk regenerates them on load.
+    if kind == "IntGrid" {
+        let old: Vec<i64> = li
+            .get("intGridCsv")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(0)).collect())
+            .unwrap_or_default();
+        let mut grid_csv = vec![0i64; (new_cw * new_ch).max(0) as usize];
+        let copy_w = old_cw.min(new_cw);
+        let copy_h = old_ch.min(new_ch);
+        for y in 0..copy_h {
+            for x in 0..copy_w {
+                let oi = (y * old_cw + x) as usize;
+                let ni = (y * new_cw + x) as usize;
+                if oi < old.len() && ni < grid_csv.len() {
+                    grid_csv[ni] = old[oi];
+                }
+            }
+        }
+        li["intGridCsv"] = json!(grid_csv);
+        li["autoLayerTiles"] = json!([]);
+    }
+
+    // Clip tile arrays by pixel bounds and recompute the coord-id `d` for the new width.
+    for tiles_key in ["gridTiles", "autoLayerTiles"] {
+        if let Some(tiles) = li.get_mut(tiles_key).and_then(Value::as_array_mut) {
+            tiles.retain(|t| {
+                t.get("px")
+                    .and_then(Value::as_array)
+                    .map(|p| {
+                        let x = p.first().and_then(Value::as_i64).unwrap_or(0);
+                        let y = p.get(1).and_then(Value::as_i64).unwrap_or(0);
+                        x >= 0 && y >= 0 && x < px_wid && y < px_hei
+                    })
+                    .unwrap_or(false)
+            });
+            for t in tiles.iter_mut() {
+                let (x, y) = t
+                    .get("px")
+                    .and_then(Value::as_array)
+                    .map(|p| {
+                        (
+                            p.first().and_then(Value::as_i64).unwrap_or(0),
+                            p.get(1).and_then(Value::as_i64).unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                t["d"] = json!([(y / grid) * new_cw + (x / grid)]);
+            }
+        }
+    }
+
+    // Clip entity instances whose grid cell now falls outside the level.
+    if let Some(ents) = li.get_mut("entityInstances").and_then(Value::as_array_mut) {
+        ents.retain(|e| {
+            e.get("__grid")
+                .and_then(Value::as_array)
+                .map(|g| {
+                    let cx = g.first().and_then(Value::as_i64).unwrap_or(0);
+                    let cy = g.get(1).and_then(Value::as_i64).unwrap_or(0);
+                    cx >= 0 && cy >= 0 && cx < new_cw && cy < new_ch
+                })
+                .unwrap_or(true)
+        });
+    }
+
+    li["__cWid"] = json!(new_cw);
+    li["__cHei"] = json!(new_ch);
+}
+
 /// Cheap non-crypto seed for auto-layer rendering (LDtk just needs *a* number).
 fn rng_seed() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -680,6 +1101,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.ldtk"),
             root,
             dirty: false,
+            pending_external_deletes: Vec::new(),
         }
     }
 
@@ -868,6 +1290,245 @@ mod tests {
         let levels = root.get("levels").and_then(Value::as_array).unwrap();
         assert!(!levels[0].get("layerInstances").unwrap().is_null());
         assert!(levels[1].get("layerInstances").unwrap().is_null());
+    }
+
+    #[test]
+    fn entity_instance_ref_finds_by_iid() {
+        let p = project(json!({
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [
+                    { "__type": "IntGrid", "__identifier": "Collisions", "entityInstances": [] },
+                    { "__type": "Entities", "__identifier": "Entities", "entityInstances": [
+                        { "iid": "ent-1", "__identifier": "Chest" },
+                    ] },
+                ],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        let e = p.entity_instance_ref(r, "ent-1").expect("found");
+        assert_eq!(e.get("__identifier").and_then(Value::as_str), Some("Chest"));
+        assert!(p.entity_instance_ref(r, "missing").is_none());
+    }
+
+    #[test]
+    fn entity_layer_instances_filters_to_entities() {
+        let p = project(json!({
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [
+                    { "__type": "IntGrid", "__identifier": "Collisions" },
+                    { "__type": "Entities", "__identifier": "GameEntities" },
+                    { "__type": "Entities", "__identifier": "Markers" },
+                ],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        let ids: Vec<&str> = p
+            .entity_layer_instances(r)
+            .iter()
+            .filter_map(|li| li.get("__identifier").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["GameEntities", "Markers"]);
+    }
+
+    #[test]
+    fn intgrid_value_defs_reads_layer_def() {
+        let p = project(json!({
+            "defs": {
+                "layers": [{
+                    "identifier": "Collisions",
+                    "__type": "IntGrid",
+                    "intGridValues": [
+                        { "value": 1, "identifier": "wall", "color": "#000000" },
+                        { "value": 2, "identifier": "water", "color": "#0000FF" },
+                    ],
+                }],
+            },
+        }));
+        let vals = p.intgrid_value_defs("Collisions");
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0].get("identifier").and_then(Value::as_str), Some("wall"));
+        assert_eq!(vals[1].get("value").and_then(Value::as_i64), Some(2));
+        assert!(p.intgrid_value_defs("Nope").is_empty());
+    }
+
+    #[test]
+    fn delete_level_removes_and_records_external() {
+        let mut p = project(json!({
+            "externalLevels": true,
+            "levels": [
+                { "identifier": "A", "iid": "iid-a", "externalRelPath": "A.ldtkl",
+                  "__neighbours": [] },
+                { "identifier": "B", "iid": "iid-b", "externalRelPath": "B.ldtkl",
+                  "__neighbours": [{ "dir": "w", "levelIid": "iid-a" }] },
+            ],
+        }));
+        let iid = p.delete_level("A").unwrap();
+        assert_eq!(iid, "iid-a");
+        // A is gone, only B remains.
+        assert_eq!(p.find_level("A"), None);
+        assert!(p.find_level("B").is_some());
+        // External body queued for deletion.
+        assert_eq!(p.pending_external_deletes, vec!["A.ldtkl".to_string()]);
+        // Dangling neighbour ref to A removed from B.
+        let b = p.level_ref(p.find_level("B").unwrap()).unwrap();
+        assert_eq!(b.get("__neighbours").and_then(Value::as_array).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn duplicate_level_gets_fresh_ids_and_position() {
+        let mut p = project(json!({
+            "nextUid": 50,
+            "worldLayout": "Free",
+            "levels": [{
+                "identifier": "Room", "iid": "iid-room", "uid": 10,
+                "worldX": 0, "worldY": 0, "pxWid": 256, "pxHei": 256,
+                "__neighbours": [{ "dir": "e", "levelIid": "other" }],
+                "layerInstances": [{ "__identifier": "L", "iid": "li-old", "levelId": 10 }],
+            }],
+        }));
+        let dup = p.duplicate_level("Room", None).unwrap();
+        assert_eq!(dup.get("identifier").and_then(Value::as_str), Some("Room_copy"));
+        assert_eq!(dup.get("uid").and_then(Value::as_i64), Some(50));
+        assert_ne!(dup.get("iid").and_then(Value::as_str), Some("iid-room"));
+        // Repositioned to the right of the original (256 + 16 gap).
+        assert_eq!(dup.get("worldX").and_then(Value::as_i64), Some(256 + 16));
+        // Neighbours cleared, layer instance got a new iid + levelId.
+        assert_eq!(dup.get("__neighbours").and_then(Value::as_array).unwrap().len(), 0);
+        let li = &dup.get("layerInstances").and_then(Value::as_array).unwrap()[0];
+        assert_ne!(li.get("iid").and_then(Value::as_str), Some("li-old"));
+        assert_eq!(li.get("levelId").and_then(Value::as_i64), Some(50));
+        // Both levels now exist.
+        assert!(p.find_level("Room").is_some());
+        assert!(p.find_level("Room_copy").is_some());
+    }
+
+    #[test]
+    fn duplicate_level_rejects_existing_identifier() {
+        let mut p = project(json!({
+            "nextUid": 1,
+            "levels": [
+                { "identifier": "A", "uid": 1, "pxWid": 64, "pxHei": 64, "layerInstances": [] },
+                { "identifier": "B", "uid": 2, "pxWid": 64, "pxHei": 64, "layerInstances": [] },
+            ],
+        }));
+        let err = p.duplicate_level("A", Some("B")).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn move_level_sets_world_position() {
+        let mut p = project(json!({
+            "levels": [{ "identifier": "A", "worldX": 0, "worldY": 0 }],
+        }));
+        p.move_level("A", 320, -64).unwrap();
+        let a = p.level_ref(p.find_level("A").unwrap()).unwrap();
+        assert_eq!(a.get("worldX").and_then(Value::as_i64), Some(320));
+        assert_eq!(a.get("worldY").and_then(Value::as_i64), Some(-64));
+    }
+
+    #[test]
+    fn resize_level_expands_and_shrinks_intgrid_with_clipping() {
+        let mut p = project(json!({
+            "levels": [{
+                "identifier": "A", "pxWid": 32, "pxHei": 32,
+                "layerInstances": [{
+                    "__identifier": "Collisions", "__type": "IntGrid",
+                    "__cWid": 2, "__cHei": 2, "__gridSize": 16,
+                    // row-major 2x2: [1,2,3,4]
+                    "intGridCsv": [1, 2, 3, 4], "autoLayerTiles": [{ "px": [0, 0] }],
+                    "gridTiles": [], "entityInstances": [],
+                }],
+            }],
+        }));
+        // Expand to 3x2 cells (48x32px): top-left 2x2 preserved, new cells 0.
+        p.resize_level("A", 48, 32).unwrap();
+        let li = &p.level_ref(p.find_level("A").unwrap()).unwrap()["layerInstances"][0];
+        assert_eq!(li.get("__cWid").and_then(Value::as_i64), Some(3));
+        assert_eq!(li.get("__cHei").and_then(Value::as_i64), Some(2));
+        let csv: Vec<i64> = li["intGridCsv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        // new width 3: row0 = [1,2,0], row1 = [3,4,0]
+        assert_eq!(csv, vec![1, 2, 0, 3, 4, 0]);
+        // AutoLayer tiles cleared on IntGrid resize.
+        assert_eq!(li["autoLayerTiles"].as_array().unwrap().len(), 0);
+
+        // Shrink to 1x1 cell (16x16px): only top-left cell survives.
+        p.resize_level("A", 16, 16).unwrap();
+        let li = &p.level_ref(p.find_level("A").unwrap()).unwrap()["layerInstances"][0];
+        assert_eq!(li.get("__cWid").and_then(Value::as_i64), Some(1));
+        let csv: Vec<i64> = li["intGridCsv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        assert_eq!(csv, vec![1]);
+    }
+
+    #[test]
+    fn resize_level_clips_tiles_and_entities() {
+        let mut p = project(json!({
+            "levels": [{
+                "identifier": "A", "pxWid": 64, "pxHei": 64,
+                "layerInstances": [{
+                    "__identifier": "Tiles", "__type": "Tiles",
+                    "__cWid": 4, "__cHei": 4, "__gridSize": 16,
+                    "intGridCsv": [], "autoLayerTiles": [],
+                    "gridTiles": [
+                        { "px": [0, 0], "d": [0] },
+                        { "px": [48, 48], "d": [15] },
+                    ],
+                    "entityInstances": [
+                        { "__grid": [0, 0] },
+                        { "__grid": [3, 3] },
+                    ],
+                }],
+            }],
+        }));
+        // Shrink to 2x2 cells (32x32px): only the (0,0) tile and entity survive.
+        p.resize_level("A", 32, 32).unwrap();
+        let li = &p.level_ref(p.find_level("A").unwrap()).unwrap()["layerInstances"][0];
+        let tiles = li["gridTiles"].as_array().unwrap();
+        assert_eq!(tiles.len(), 1);
+        // d recomputed for the new width (2): cell (0,0) -> 0.
+        assert_eq!(tiles[0]["d"], json!([0]));
+        assert_eq!(li["entityInstances"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_world_appends_with_defaults_and_rejects_dupes() {
+        let mut p = project(json!({ "defaultLevelWidth": 320, "defaultLevelHeight": 240 }));
+        let w = p.create_world("Overworld", None, None, None, None, None).unwrap();
+        assert_eq!(w.get("worldLayout").and_then(Value::as_str), Some("Free"));
+        assert_eq!(w.get("defaultLevelWidth").and_then(Value::as_i64), Some(320));
+        assert_eq!(p.find_world("Overworld"), Some(0));
+        let err = p
+            .create_world("Overworld", None, None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn set_world_layout_updates_fields() {
+        let mut p = project(json!({
+            "worlds": [{ "identifier": "W", "iid": "w-iid", "worldLayout": "Free",
+                         "worldGridWidth": 256, "worldGridHeight": 256, "levels": [] }],
+        }));
+        p.set_world_layout("W", Some("GridVania"), Some(128), None).unwrap();
+        let w = &p.root["worlds"][0];
+        assert_eq!(w.get("worldLayout").and_then(Value::as_str), Some("GridVania"));
+        assert_eq!(w.get("worldGridWidth").and_then(Value::as_i64), Some(128));
+        assert_eq!(w.get("worldGridHeight").and_then(Value::as_i64), Some(256));
+        // Addressable by iid too.
+        assert_eq!(p.find_world("w-iid"), Some(0));
+        assert!(p.set_world_layout("missing", Some("Free"), None, None).is_err());
     }
 
     #[test]

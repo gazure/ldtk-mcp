@@ -25,7 +25,17 @@ Requires a recent stable Rust toolchain.
 | `list_levels` | List levels with world position and size (across all worlds). |
 | `describe_defs` | Layers (incl. IntGrid values), entities (incl. fields), tilesets, enums. Call before generating. |
 | `get_level` | Summary of a level and its layer instances (content counts). |
+| `get_layer` | Full content of one layer instance: IntGrid CSV, grid tiles, or entities (with decoded fields). |
+| `get_entities` | List entity instances on a level (one layer or all) with iid, grid position, tags, and decoded field values. |
+| `get_intgrid` | Read an IntGrid layer: dimensions, the row-major `csv`, and value definitions (number to identifier/color). |
+| `get_entity` | Fetch a single entity instance by iid, with a decoded `fields` map and the raw `fieldInstances`. |
 | `create_level` | Append a new empty level; layer instances are built from the project's layer defs. |
+| `duplicate_level` | Deep-copy a level (fresh uid/iids) to the next free world position. |
+| `move_level` | Set a level's world-space pixel position (`worldX`/`worldY`). |
+| `resize_level` | Resize a level; layer instances are reflowed and out-of-bounds tiles/entities are clipped. |
+| `delete_level` | Delete a level; external `.ldtkl` files are removed on `save_project`. |
+| `create_world` | Create a new empty world (multi-world projects); appends to the root `worlds` array. |
+| `set_world_layout` | Update a world's layout and/or grid dimensions (`worldLayout`, `worldGridWidth/Height`). |
 | `set_intgrid` | Set an IntGrid layer via a full `csv` and/or rectangle fills. Clears AutoLayer tiles so LDtk regenerates them. |
 | `place_entities` | Place entity instances on an Entity layer using grid coordinates, with optional typed `fields`. |
 | `set_entity_fields` | Set typed field values on an existing entity instance (by iid). |
@@ -84,12 +94,12 @@ Unit tests cover the pure logic (typed-field encoding, project tree manipulation
 cargo test
 ```
 
-The end-to-end smoke test drives the server over stdio against the bundled samples and asserts
-typed entity fields, tile painting, separate-level-file round-trips, and multi-world editing all
-work:
+The end-to-end smoke test drives the server over stdio against the samples in `samples/` and
+asserts typed entity fields, tile painting, separate-level-file round-trips, and multi-world
+editing all work:
 
 ```bash
-python3 smoke_test.py
+python3 scripts/smoke_test.py
 ```
 
 ## Current limitations

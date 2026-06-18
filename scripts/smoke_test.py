@@ -7,9 +7,11 @@ separate level files (.ldtkl) round-trip, and multi-world editing.
 import json, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SAMPLES = os.path.join(HERE, "../app/extraFiles/samples")
-TESTS = os.path.join(HERE, "../tests")
-BIN = os.path.join(HERE, "target/debug/ldtk-mcp")
+ROOT = os.path.dirname(HERE)
+SAMPLES = os.path.join(ROOT, "samples")
+# Support assets (atlas images, .ldtkl level bodies) live in a nested dir.
+SUPPORT = os.path.join(SAMPLES, "samples")
+BIN = os.path.join(ROOT, "target/debug/ldtk-mcp")
 
 PASS, FAIL = 0, 0
 
@@ -96,6 +98,18 @@ def test_typed_entity_fields():
                           "fields": {"content": ["Gold", "Trout"], "requireKey": True}}],
         })
         check("place_entities w/ fields", status == "OK", msg)
+        # Read the entities back through the new query-depth tool before saving.
+        status, listing = s.call("get_entities", {"level": level, "layer": "GameEntities"})
+        check("get_entities runs", status == "OK", listing)
+        if status == "OK":
+            data = json.loads(listing)
+            ents = [e for grp in data for e in grp["entities"]]
+            chest = next((e for e in ents if e["identifier"] == "Chest" and e["cx"] == 5 and e["cy"] == 5), None)
+            check("get_entities returns placed chest", chest is not None, listing[:200])
+            if chest:
+                check("get_entities decodes content field",
+                      chest["fields"].get("content") == ["Gold", "Trout"], chest["fields"])
+                check("get_entities exposes iid", bool(chest.get("iid")), chest)
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
         s.close()
@@ -157,11 +171,17 @@ def test_paint_tiles():
 def test_external_levels():
     print("Separate level files round-trip (SeparateLevelFiles.ldtk)")
     wd = workdir()
-    f = copy_into(wd, "SeparateLevelFiles.ldtk", "SeparateLevelFiles")
+    f = copy_into(wd, "SeparateLevelFiles.ldtk")
+    # The .ldtkl bodies live in the nested support dir; place them beside the .ldtk
+    # so the relative externalRelPath resolves.
+    shutil.copytree(os.path.join(SUPPORT, "SeparateLevelFiles"), os.path.join(wd, "SeparateLevelFiles"))
     proj = json.load(open(f))
     level = proj["levels"][0]["identifier"]
     ext_rel = proj["levels"][0]["externalRelPath"]
     intgrid = find_layer(proj, "IntGrid")
+    # A different external level we'll delete, to verify its .ldtkl is unlinked on save.
+    victim = proj["levels"][1]["identifier"]
+    victim_rel = proj["levels"][1]["externalRelPath"]
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
@@ -170,6 +190,17 @@ def test_external_levels():
             "rects": [{"cx": 0, "cy": 0, "w": 3, "h": 3, "value": 1}],
         })
         check("set_intgrid on external level", status == "OK", msg)
+        # Read the IntGrid back and confirm the fill round-trips.
+        status, grid = s.call("get_intgrid", {"level": level, "layer": intgrid})
+        check("get_intgrid runs", status == "OK", grid)
+        if status == "OK":
+            g = json.loads(grid)
+            check("get_intgrid round-trips fill", sum(1 for v in g["csv"] if v != 0) >= 9, sum(1 for v in g["csv"] if v != 0))
+            check("get_intgrid reports dimensions", g["cWid"] > 0 and g["cHei"] > 0, g)
+        # Delete a separate external level; its body should be removed on save.
+        check("victim .ldtkl exists before delete", os.path.exists(os.path.join(wd, victim_rel)))
+        status, msg = s.call("delete_level", {"level": victim})
+        check("delete external level", status == "OK", msg)
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
         s.close()
@@ -177,21 +208,41 @@ def test_external_levels():
     main = json.load(open(f))
     main_lvl = next(l for l in main["levels"] if l["identifier"] == level)
     check("main file layerInstances nulled", main_lvl["layerInstances"] is None)
+    check("deleted level gone from main", all(l["identifier"] != victim for l in main["levels"]))
+    check("deleted .ldtkl unlinked on save", not os.path.exists(os.path.join(wd, victim_rel)), victim_rel)
     body = json.load(open(os.path.join(wd, ext_rel)))
     li = next(x for x in body["layerInstances"] if x["__identifier"] == intgrid)
     check(".ldtkl intGrid updated", sum(1 for v in li["intGridCsv"] if v != 0) >= 9,
           sum(1 for v in li["intGridCsv"] if v != 0))
 
 
+def find_multi_world_sample():
+    """Return (path, proj) for the first sample using the `worlds[]` array, else None."""
+    for name in sorted(os.listdir(SAMPLES)):
+        if not name.endswith(".ldtk"):
+            continue
+        try:
+            proj = json.load(open(os.path.join(SAMPLES, name)))
+        except (json.JSONDecodeError, IsADirectoryError, UnicodeDecodeError):
+            continue
+        if any(w.get("levels") for w in (proj.get("worlds") or [])):
+            return os.path.join(SAMPLES, name), proj
+    return None
+
+
 def test_multi_world():
-    print("Multi-world editing (multiWorldsTest.ldtk)")
+    print("Multi-world editing")
+    found_sample = find_multi_world_sample()
+    if not found_sample:
+        print("  SKIP no multi-world (worlds[]) sample available")
+        return
+    src, proj = found_sample
     wd = workdir()
-    f = os.path.join(wd, "multiWorldsTest.ldtk")
-    shutil.copy(os.path.join(TESTS, "multiWorldsTest.ldtk"), f)
-    proj = json.load(open(f))
+    f = os.path.join(wd, os.path.basename(src))
+    shutil.copy(src, f)
     # Find a world level with an IntGrid layer.
     target = None
-    for wi, w in enumerate(proj.get("worlds", [])):
+    for w in proj.get("worlds", []):
         for lvl in w.get("levels", []):
             for li in lvl.get("layerInstances") or []:
                 if li["__type"] == "IntGrid":
@@ -229,6 +280,65 @@ def test_multi_world():
     check("world level intGrid updated", found)
 
 
+def test_level_lifecycle():
+    print("Level lifecycle (Typical_TopDown_example.ldtk)")
+    wd = workdir()
+    f = copy_into(wd, "Typical_TopDown_example.ldtk")
+    s = Session()
+    try:
+        assert s.call("open_project", {"path": f})[0] == "OK"
+        st, msg = s.call("create_level", {"identifier": "LC_Base", "px_wid": 256, "px_hei": 256})
+        check("create_level", st == "OK", msg)
+        st, msg = s.call("duplicate_level", {"level": "LC_Base", "identifier": "LC_Copy"})
+        check("duplicate_level", st == "OK", msg)
+        st, msg = s.call("move_level", {"level": "LC_Copy", "world_x": 2048, "world_y": 512})
+        check("move_level", st == "OK", msg)
+        st, msg = s.call("resize_level", {"level": "LC_Copy", "px_wid": 128, "px_hei": 128})
+        check("resize_level", st == "OK", msg)
+        st, lvl = s.call("get_level", {"level": "LC_Copy"})
+        check("get_level after resize", st == "OK", lvl)
+        if st == "OK":
+            g = json.loads(lvl)
+            check("resized dimensions", g["pxWid"] == 128 and g["pxHei"] == 128, (g.get("pxWid"), g.get("pxHei")))
+            ig = next((L for L in g["layers"] if L["type"] == "IntGrid"), None)
+            if ig:
+                check("intgrid reflowed to new width", ig["cWid"] == 128 // ig["gridSize"], ig)
+        st, msg = s.call("delete_level", {"level": "LC_Copy"})
+        check("delete_level", st == "OK", msg)
+        st, listing = s.call("list_levels", {})
+        check("deleted level gone", st == "OK" and "LC_Copy" not in listing, listing[:200])
+        check("base level remains", "LC_Base" in listing, listing[:200])
+        check("save", s.call("save_project", {})[0] == "OK")
+    finally:
+        s.close()
+
+
+def test_world_tools():
+    print("World tools (Typical_TopDown_example.ldtk)")
+    wd = workdir()
+    f = copy_into(wd, "Typical_TopDown_example.ldtk")
+    s = Session()
+    try:
+        assert s.call("open_project", {"path": f})[0] == "OK"
+        st, msg = s.call("create_world", {
+            "identifier": "NewWorld", "world_layout": "GridVania", "world_grid_width": 128,
+        })
+        check("create_world", st == "OK", msg)
+        st, msg = s.call("set_world_layout", {"world": "NewWorld", "world_layout": "Free"})
+        check("set_world_layout", st == "OK", msg)
+        check("save", s.call("save_project", {})[0] == "OK")
+    finally:
+        s.close()
+
+    saved = json.load(open(f))
+    worlds = saved.get("worlds") or []
+    nw = next((w for w in worlds if w["identifier"] == "NewWorld"), None)
+    check("world persisted", nw is not None, [w.get("identifier") for w in worlds])
+    if nw:
+        check("world layout updated", nw["worldLayout"] == "Free", nw["worldLayout"])
+        check("world grid width set", nw["worldGridWidth"] == 128, nw["worldGridWidth"])
+
+
 def test_validate():
     print("Validation (Entities.ldtk)")
     wd = workdir()
@@ -246,11 +356,13 @@ def test_validate():
 
 
 if __name__ == "__main__":
-    subprocess.run(["cargo", "build", "--quiet"], cwd=HERE, check=True)
+    subprocess.run(["cargo", "build", "--quiet"], cwd=ROOT, check=True)
     test_typed_entity_fields()
     test_paint_tiles()
     test_external_levels()
     test_multi_world()
+    test_level_lifecycle()
+    test_world_tools()
     test_validate()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

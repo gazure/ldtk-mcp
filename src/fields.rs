@@ -383,6 +383,7 @@ mod tests {
             path: PathBuf::from("/tmp/test.ldtk"),
             root,
             dirty: false,
+            pending_external_deletes: Vec::new(),
         }
     }
 
@@ -395,7 +396,7 @@ mod tests {
         assert_eq!(int_to_hex(0xFF_8000), "#FF8000");
         assert_eq!(int_to_hex(0), "#000000");
         // High bits beyond 24 are masked off.
-        assert_eq!(int_to_hex(0xAB_FF_8000u32 as i64), "#FF8000");
+        assert_eq!(int_to_hex(0xABFF_8000_u32 as i64), "#FF8000");
     }
 
     #[test]
@@ -503,7 +504,10 @@ mod tests {
         let d = def("name", FieldKind::String, "String");
         let out = p.encode_field(&d, &json!("a\nb")).unwrap();
         assert_eq!(out["__value"], json!("a\\nb"));
-        assert_eq!(out["realEditorValues"], json!([{ "id": "V_String", "params": ["a\\nb"] }]));
+        assert_eq!(
+            out["realEditorValues"],
+            json!([{ "id": "V_String", "params": ["a\\nb"] }])
+        );
     }
 
     #[test]
@@ -512,7 +516,10 @@ mod tests {
         let d = def("tint", FieldKind::Color, "Color");
         let out = p.encode_field(&d, &json!("#FF8000")).unwrap();
         assert_eq!(out["__value"], json!("#FF8000"));
-        assert_eq!(out["realEditorValues"], json!([{ "id": "V_Int", "params": [0xFF_8000] }]));
+        assert_eq!(
+            out["realEditorValues"],
+            json!([{ "id": "V_Int", "params": [0xFF_8000] }])
+        );
         assert!(p.encode_field(&d, &json!("nope")).is_err());
     }
 
@@ -522,7 +529,10 @@ mod tests {
         let d = def("spot", FieldKind::Point, "Point");
         let out = p.encode_field(&d, &json!({ "cx": 2, "cy": 3 })).unwrap();
         assert_eq!(out["__value"], json!({ "cx": 2, "cy": 3 }));
-        assert_eq!(out["realEditorValues"], json!([{ "id": "V_String", "params": ["2,3"] }]));
+        assert_eq!(
+            out["realEditorValues"],
+            json!([{ "id": "V_String", "params": ["2,3"] }])
+        );
     }
 
     #[test]

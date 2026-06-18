@@ -29,6 +29,33 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
+/// Compact, agent-friendly view of an entity instance: grid coords, size, tags, and a
+/// `fields` map of `__identifier` -> `__value` folded from `fieldInstances`.
+fn entity_summary(e: &Value) -> Value {
+    let grid = e.get("__grid").and_then(Value::as_array);
+    let cx = grid.and_then(|g| g.first()).and_then(Value::as_i64);
+    let cy = grid.and_then(|g| g.get(1)).and_then(Value::as_i64);
+    let mut fields = serde_json::Map::new();
+    if let Some(fis) = e.get("fieldInstances").and_then(Value::as_array) {
+        for fi in fis {
+            if let Some(id) = fi.get("__identifier").and_then(Value::as_str) {
+                fields.insert(id.to_string(), fi.get("__value").cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+    json!({
+        "iid": e.get("iid"),
+        "identifier": e.get("__identifier"),
+        "cx": cx,
+        "cy": cy,
+        "px": e.get("px"),
+        "width": e.get("width"),
+        "height": e.get("height"),
+        "tags": e.get("__tags"),
+        "fields": Value::Object(fields),
+    })
+}
+
 /// Merge encoded field instances into a `fieldInstances` array: replace entries with the
 /// same `__identifier`, append new ones.
 fn merge_field_instances(target: &mut Value, encoded: Vec<Value>) {
@@ -187,6 +214,102 @@ pub struct ClearTilesArgs {
     pub layer: String,
     /// Optional grid rectangle to clear. If omitted, clears the whole layer.
     pub rect: Option<GridRect>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetLayerArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// Layer identifier or iid.
+    pub layer: String,
+    /// Include the full `autoLayerTiles` array (can be large). Default false (count only).
+    pub include_auto_tiles: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetEntitiesArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// Optional Entity layer identifier or iid. If omitted, scans all Entity layers.
+    pub layer: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetIntGridArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// IntGrid layer identifier or iid.
+    pub layer: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GetEntityArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// Instance iid of the entity to fetch.
+    pub entity_iid: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DeleteLevelArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DuplicateLevelArgs {
+    /// Source level identifier, iid, or uid.
+    pub level: String,
+    /// Identifier for the copy. Defaults to `<source>_copy` (deduplicated).
+    pub identifier: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MoveLevelArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// New world-space X position in pixels.
+    pub world_x: i64,
+    /// New world-space Y position in pixels.
+    pub world_y: i64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ResizeLevelArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// New level width in pixels.
+    pub px_wid: i64,
+    /// New level height in pixels.
+    pub px_hei: i64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateWorldArgs {
+    /// Unique identifier for the new world.
+    pub identifier: String,
+    /// World layout: `Free`, `GridVania`, `LinearHorizontal`, or `LinearVertical`. Default `Free`.
+    pub world_layout: Option<String>,
+    /// World grid width in pixels (GridVania). Default 256.
+    pub world_grid_width: Option<i64>,
+    /// World grid height in pixels (GridVania). Default 256.
+    pub world_grid_height: Option<i64>,
+    /// Default new-level width in pixels. Defaults to the project's `defaultLevelWidth`.
+    pub default_level_width: Option<i64>,
+    /// Default new-level height in pixels. Defaults to the project's `defaultLevelHeight`.
+    pub default_level_height: Option<i64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SetWorldLayoutArgs {
+    /// World identifier or iid.
+    pub world: String,
+    /// New world layout: `Free`, `GridVania`, `LinearHorizontal`, or `LinearVertical`.
+    pub world_layout: Option<String>,
+    /// New world grid width in pixels (GridVania).
+    pub world_grid_width: Option<i64>,
+    /// New world grid height in pixels (GridVania).
+    pub world_grid_height: Option<i64>,
 }
 
 // ---- Tool implementations --------------------------------------------------
@@ -378,6 +501,146 @@ impl LdtkServer {
         })
     }
 
+    #[tool(
+        description = "Read the full content of a single layer instance: IntGrid CSV, grid tiles, or entities (with decoded fields), plus dimensions. AutoLayer tiles are counted unless include_auto_tiles is true."
+    )]
+    fn get_layer(&self, Parameters(args): Parameters<GetLayerArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let idx = p
+                .find_level(&args.level)
+                .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
+            let li = p
+                .layer_instance_ref(idx, &args.layer)
+                .ok_or_else(|| err(format!("layer '{}' not found in level", args.layer)))?;
+            let kind = li.get("__type").and_then(Value::as_str).unwrap_or("");
+            let mut out = json!({
+                "identifier": li.get("__identifier"),
+                "type": li.get("__type"),
+                "cWid": li.get("__cWid"),
+                "cHei": li.get("__cHei"),
+                "gridSize": li.get("__gridSize"),
+                "tilesetDefUid": li.get("__tilesetDefUid"),
+                "tilesetRelPath": li.get("__tilesetRelPath"),
+                "opacity": li.get("__opacity"),
+                "visible": li.get("visible"),
+            });
+            let obj = out.as_object_mut().unwrap();
+            match kind {
+                "IntGrid" => {
+                    obj.insert("intGridCsv".into(), li.get("intGridCsv").cloned().unwrap_or(json!([])));
+                }
+                "Tiles" => {
+                    obj.insert("gridTiles".into(), li.get("gridTiles").cloned().unwrap_or(json!([])));
+                }
+                "Entities" => {
+                    let ents: Vec<Value> = li
+                        .get("entityInstances")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().map(entity_summary).collect())
+                        .unwrap_or_default();
+                    obj.insert("entities".into(), json!(ents));
+                }
+                _ => {}
+            }
+            // AutoLayer tiles can appear on IntGrid and AutoLayer layers; large and generated.
+            let auto = li.get("autoLayerTiles").and_then(Value::as_array);
+            if args.include_auto_tiles.unwrap_or(false) {
+                obj.insert("autoLayerTiles".into(), json!(auto.cloned().unwrap_or_default()));
+            } else {
+                obj.insert("autoLayerTileCount".into(), json!(auto.map(|a| a.len()).unwrap_or(0)));
+            }
+            Ok(pretty(&out))
+        })
+    }
+
+    #[tool(
+        description = "List entity instances on a level with their iid, grid position, size, tags, and decoded field values. If `layer` is omitted, scans all Entity layers."
+    )]
+    fn get_entities(&self, Parameters(args): Parameters<GetEntitiesArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let idx = p
+                .find_level(&args.level)
+                .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
+            let layers: Vec<&Value> = match &args.layer {
+                Some(layer_id) => {
+                    let li = p
+                        .layer_instance_ref(idx, layer_id)
+                        .ok_or_else(|| err(format!("layer '{layer_id}' not found in level")))?;
+                    if li.get("__type").and_then(Value::as_str) != Some("Entities") {
+                        return Err(err(format!("layer '{layer_id}' is not an Entities layer")));
+                    }
+                    vec![li]
+                }
+                None => p.entity_layer_instances(idx),
+            };
+            let mut result = Vec::new();
+            for li in layers {
+                let layer_id = li.get("__identifier").and_then(Value::as_str).unwrap_or("");
+                let entities: Vec<Value> = li
+                    .get("entityInstances")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().map(entity_summary).collect())
+                    .unwrap_or_default();
+                result.push(json!({ "layer": layer_id, "entities": entities }));
+            }
+            Ok(pretty(&json!(result)))
+        })
+    }
+
+    #[tool(
+        description = "Read an IntGrid layer: dimensions, the row-major `csv` (same shape set_intgrid accepts), and the value definitions (number -> identifier/color)."
+    )]
+    fn get_intgrid(&self, Parameters(args): Parameters<GetIntGridArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let idx = p
+                .find_level(&args.level)
+                .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
+            let li = p
+                .layer_instance_ref(idx, &args.layer)
+                .ok_or_else(|| err(format!("layer '{}' not found in level", args.layer)))?;
+            if li.get("__type").and_then(Value::as_str) != Some("IntGrid") {
+                return Err(err(format!("layer '{}' is not an IntGrid layer", args.layer)));
+            }
+            let layer_id = li
+                .get("__identifier")
+                .and_then(Value::as_str)
+                .unwrap_or(&args.layer)
+                .to_string();
+            let payload = json!({
+                "identifier": li.get("__identifier"),
+                "cWid": li.get("__cWid"),
+                "cHei": li.get("__cHei"),
+                "gridSize": li.get("__gridSize"),
+                "csv": li.get("intGridCsv").cloned().unwrap_or(json!([])),
+                "values": p.intgrid_value_defs(&layer_id),
+            });
+            Ok(pretty(&payload))
+        })
+    }
+
+    #[tool(
+        description = "Fetch a single entity instance by its iid, including a decoded `fields` map and the raw `fieldInstances` (useful before set_entity_fields)."
+    )]
+    fn get_entity(&self, Parameters(args): Parameters<GetEntityArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let idx = p
+                .find_level(&args.level)
+                .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
+            let e = p.entity_instance_ref(idx, &args.entity_iid).ok_or_else(|| {
+                err(format!(
+                    "entity '{}' not found in level '{}'",
+                    args.entity_iid, args.level
+                ))
+            })?;
+            let mut summary = entity_summary(e);
+            summary.as_object_mut().unwrap().insert(
+                "fieldInstances".into(),
+                e.get("fieldInstances").cloned().unwrap_or(json!([])),
+            );
+            Ok(pretty(&summary))
+        })
+    }
+
     #[tool(description = "Create a new empty level. Layer instances are generated from the project layer definitions.")]
     fn create_level(&self, Parameters(args): Parameters<CreateLevelArgs>) -> Result<String, ErrorData> {
         self.with_project(|p| {
@@ -400,6 +663,113 @@ impl LdtkServer {
                 level.get("uid").and_then(Value::as_i64).unwrap_or(0),
                 level.get("iid").and_then(Value::as_str).unwrap_or(""),
             ))
+        })
+    }
+
+    #[tool(
+        description = "Delete a level by identifier/iid/uid. For external-level projects the .ldtkl file is removed on save_project."
+    )]
+    fn delete_level(&self, Parameters(args): Parameters<DeleteLevelArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let iid = p.delete_level(&args.level).map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Deleted level '{}' (iid={}). Call save_project to persist.",
+                args.level, iid
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Duplicate a level (deep copy with fresh uid/iids), placed at the next free world position. Optionally name the copy."
+    )]
+    fn duplicate_level(&self, Parameters(args): Parameters<DuplicateLevelArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let level = p
+                .duplicate_level(&args.level, args.identifier.as_deref())
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Duplicated '{}' as '{}' (uid={}, iid={}). Call save_project to persist.",
+                args.level,
+                level.get("identifier").and_then(Value::as_str).unwrap_or(""),
+                level.get("uid").and_then(Value::as_i64).unwrap_or(0),
+                level.get("iid").and_then(Value::as_str).unwrap_or(""),
+            ))
+        })
+    }
+
+    #[tool(description = "Move a level to a new world-space pixel position (worldX/worldY).")]
+    fn move_level(&self, Parameters(args): Parameters<MoveLevelArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            p.move_level(&args.level, args.world_x, args.world_y)
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Moved level '{}' to ({}, {}). Call save_project to persist.",
+                args.level, args.world_x, args.world_y
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Resize a level. Layer instances are reflowed: IntGrid is resized, and tiles/entities outside the new bounds are clipped."
+    )]
+    fn resize_level(&self, Parameters(args): Parameters<ResizeLevelArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            p.resize_level(&args.level, args.px_wid, args.px_hei)
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Resized level '{}' to {}x{}px (content clipped to bounds). Call save_project to persist.",
+                args.level, args.px_wid, args.px_hei
+            ))
+        })
+    }
+
+    #[tool(description = "Create a new (empty) world in a multi-world project. Appends to the root `worlds` array.")]
+    fn create_world(&self, Parameters(args): Parameters<CreateWorldArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let root_has_levels = p
+                .root
+                .get("levels")
+                .and_then(Value::as_array)
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            let world = p
+                .create_world(
+                    &args.identifier,
+                    args.world_layout.as_deref(),
+                    args.world_grid_width,
+                    args.world_grid_height,
+                    args.default_level_width,
+                    args.default_level_height,
+                )
+                .map_err(|e| err(format!("{e:#}")))?;
+            let note = if root_has_levels {
+                " Note: this project also has root-level `levels`; multi-world tools address worlds separately."
+            } else {
+                ""
+            };
+            Ok(format!(
+                "Created world '{}' (iid={}, layout={}).{} Call save_project to persist.",
+                args.identifier,
+                world.get("iid").and_then(Value::as_str).unwrap_or(""),
+                world.get("worldLayout").and_then(Value::as_str).unwrap_or("Free"),
+                note,
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Update a world's layout and/or grid dimensions (worldLayout, worldGridWidth, worldGridHeight)."
+    )]
+    fn set_world_layout(&self, Parameters(args): Parameters<SetWorldLayoutArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            p.set_world_layout(
+                &args.world,
+                args.world_layout.as_deref(),
+                args.world_grid_width,
+                args.world_grid_height,
+            )
+            .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!("Updated world '{}'. Call save_project to persist.", args.world))
         })
     }
 
@@ -805,6 +1175,10 @@ impl LdtkServer {
 impl ServerHandler for LdtkServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo {
+            // Advertise the `tools` capability during the handshake. Without this,
+            // clients won't issue `tools/list` and the server appears to expose 0 tools
+            // even though the tool router is wired up.
+            capabilities: rmcp::model::ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(
                 "Edit LDtk (.ldtk) projects to generate game levels. \
                  Workflow: open_project -> describe_defs -> create_level / set_intgrid / place_entities -> validate_project -> save_project. \
@@ -813,5 +1187,44 @@ impl ServerHandler for LdtkServer {
             ),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_summary_maps_grid_size_and_fields() {
+        let e = json!({
+            "iid": "ent-1",
+            "__identifier": "Chest",
+            "__grid": [5, 7],
+            "px": [80, 112],
+            "width": 24,
+            "height": 24,
+            "__tags": ["loot"],
+            "fieldInstances": [
+                { "__identifier": "content", "__value": ["Gold", "Trout"] },
+                { "__identifier": "requireKey", "__value": true },
+            ],
+        });
+        let s = entity_summary(&e);
+        assert_eq!(s.get("iid").and_then(Value::as_str), Some("ent-1"));
+        assert_eq!(s.get("identifier").and_then(Value::as_str), Some("Chest"));
+        assert_eq!(s.get("cx").and_then(Value::as_i64), Some(5));
+        assert_eq!(s.get("cy").and_then(Value::as_i64), Some(7));
+        assert_eq!(s.get("width").and_then(Value::as_i64), Some(24));
+        assert_eq!(s["fields"]["content"], json!(["Gold", "Trout"]));
+        assert_eq!(s["fields"]["requireKey"], json!(true));
+        assert_eq!(s["tags"], json!(["loot"]));
+    }
+
+    #[test]
+    fn entity_summary_tolerates_missing_optional_fields() {
+        let e = json!({ "iid": "x", "__identifier": "Mob" });
+        let s = entity_summary(&e);
+        assert_eq!(s.get("cx").cloned(), Some(Value::Null));
+        assert_eq!(s["fields"], json!({}));
     }
 }
