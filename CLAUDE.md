@@ -5,4 +5,4 @@ An MCP server for LDTK (level design toolkit)
 
 - put sample levels in samples/
 - testing scripts in scripts/
-- code should pass fmt and clippy
+- code should pass +nightly fmt and +stable clippy
