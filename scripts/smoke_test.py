@@ -110,6 +110,29 @@ def test_typed_entity_fields():
                 check("get_entities decodes content field",
                       chest["fields"].get("content") == ["Gold", "Trout"], chest["fields"])
                 check("get_entities exposes iid", bool(chest.get("iid")), chest)
+        # Tier 2.5 single-instance ops: operate on a throwaway entity so the (5,5)
+        # Chest stays intact for the on-disk field assertions below.
+        s.call("place_entities", {
+            "level": level, "layer": "GameEntities",
+            "entities": [{"identifier": "Chest", "cx": 1, "cy": 1}],
+        })
+        st, listing = s.call("get_entities", {"level": level, "layer": "GameEntities"})
+        tmp = None
+        if st == "OK":
+            ents = [e for grp in json.loads(listing) for e in grp["entities"]]
+            tmp = next((e for e in ents if e["cx"] == 1 and e["cy"] == 1), None)
+        if tmp and tmp.get("iid"):
+            iid = tmp["iid"]
+            st, msg = s.call("move_entity", {"level": level, "entity_iid": iid, "cx": 8, "cy": 9})
+            check("move_entity", st == "OK", msg)
+            st, got = s.call("get_entity", {"level": level, "entity_iid": iid})
+            if st == "OK":
+                g = json.loads(got)
+                check("move_entity updates grid", g["cx"] == 8 and g["cy"] == 9, (g.get("cx"), g.get("cy")))
+            st, msg = s.call("delete_entity", {"level": level, "entity_iid": iid})
+            check("delete_entity", st == "OK", msg)
+            st, got = s.call("get_entity", {"level": level, "entity_iid": iid})
+            check("entity gone after delete", st == "ERROR", got)
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
         s.close()
@@ -339,6 +362,51 @@ def test_world_tools():
         check("world grid width set", nw["worldGridWidth"] == 128, nw["worldGridWidth"])
 
 
+def test_flood_fill():
+    print("IntGrid flood fill (Typical_TopDown_example.ldtk)")
+    wd = workdir()
+    f = copy_into(wd, "Typical_TopDown_example.ldtk")
+    proj = json.load(open(f))
+    intgrid = find_layer(proj, "IntGrid")
+    if not intgrid:
+        check("intgrid layer available", False, "none found")
+        return
+    s = Session()
+    try:
+        assert s.call("open_project", {"path": f})[0] == "OK"
+        st, msg = s.call("create_level", {"identifier": "FF_Test", "px_wid": 128, "px_hei": 128})
+        check("create_level", st == "OK", msg)
+        # Seed a closed border so the interior fill is bounded.
+        st, dims = s.call("get_intgrid", {"level": "FF_Test", "layer": intgrid})
+        check("get_intgrid", st == "OK", dims)
+        g = json.loads(dims)
+        cw, ch = g["cWid"], g["cHei"]
+        rects = [
+            {"cx": 0, "cy": 0, "w": cw, "h": 1, "value": 1},
+            {"cx": 0, "cy": ch - 1, "w": cw, "h": 1, "value": 1},
+            {"cx": 0, "cy": 0, "w": 1, "h": ch, "value": 1},
+            {"cx": cw - 1, "cy": 0, "w": 1, "h": ch, "value": 1},
+        ]
+        st, msg = s.call("set_intgrid", {"level": "FF_Test", "layer": intgrid, "rects": rects})
+        check("seed border", st == "OK", msg)
+        # Fill the interior from a center cell.
+        st, msg = s.call("flood_fill_intgrid", {
+            "level": "FF_Test", "layer": intgrid, "cx": cw // 2, "cy": ch // 2, "value": 2,
+        })
+        check("flood_fill_intgrid", st == "OK", msg)
+        st, after = s.call("get_intgrid", {"level": "FF_Test", "layer": intgrid})
+        if st == "OK":
+            csv = json.loads(after)["csv"]
+            interior = (cw - 2) * (ch - 2)
+            check("interior filled", sum(1 for v in csv if v == 2) == interior,
+                  (sum(1 for v in csv if v == 2), interior))
+            check("border preserved", sum(1 for v in csv if v == 1) == cw * ch - interior,
+                  sum(1 for v in csv if v == 1))
+        check("save", s.call("save_project", {})[0] == "OK")
+    finally:
+        s.close()
+
+
 def test_validate():
     print("Validation (Entities.ldtk)")
     wd = workdir()
@@ -363,6 +431,7 @@ if __name__ == "__main__":
     test_multi_world()
     test_level_lifecycle()
     test_world_tools()
+    test_flood_fill()
     test_validate()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

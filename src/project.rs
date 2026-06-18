@@ -968,6 +968,130 @@ impl Project {
             })
             .ok_or_else(|| anyhow!("layer '{layer_id}' not found in level"))
     }
+
+    /// Move an existing entity instance to a new grid cell, recomputing its pixel
+    /// position from the entity definition's pivot (matching `place_entities`).
+    pub fn move_entity(&mut self, r: LevelRef, entity_iid: &str, cx: i64, cy: i64) -> Result<()> {
+        // Snapshot pivots before taking the mutable borrow of the tree.
+        let defs = self.entity_defs();
+        let mut found = false;
+        {
+            let level = self.level_value_mut(r)?;
+            let layers = level
+                .get_mut("layerInstances")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow!("level has no layerInstances"))?;
+            'outer: for li in layers {
+                let grid = li.get("__gridSize").and_then(Value::as_i64).unwrap_or(16);
+                if let Some(ents) = li.get_mut("entityInstances").and_then(Value::as_array_mut) {
+                    if let Some(e) = ents
+                        .iter_mut()
+                        .find(|e| e.get("iid").and_then(Value::as_str) == Some(entity_iid))
+                    {
+                        let id = e.get("__identifier").and_then(Value::as_str).unwrap_or("");
+                        let (pivot_x, pivot_y) = defs
+                            .iter()
+                            .find(|d| d.identifier == id)
+                            .map(|d| (d.pivot_x, d.pivot_y))
+                            .unwrap_or((0.0, 0.0));
+                        let px_x = (cx as f64 * grid as f64 + pivot_x * grid as f64).round() as i64;
+                        let px_y = (cy as f64 * grid as f64 + pivot_y * grid as f64).round() as i64;
+                        e["__grid"] = json!([cx, cy]);
+                        e["px"] = json!([px_x, px_y]);
+                        found = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if found {
+            self.dirty = true;
+            Ok(())
+        } else {
+            bail!("entity instance '{entity_iid}' not found in level")
+        }
+    }
+
+    /// Remove a single entity instance (by iid) from anywhere in a level.
+    pub fn delete_entity(&mut self, r: LevelRef, entity_iid: &str) -> Result<()> {
+        let mut removed = false;
+        {
+            let level = self.level_value_mut(r)?;
+            let layers = level
+                .get_mut("layerInstances")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow!("level has no layerInstances"))?;
+            for li in layers {
+                if let Some(ents) = li.get_mut("entityInstances").and_then(Value::as_array_mut) {
+                    let before = ents.len();
+                    ents.retain(|e| e.get("iid").and_then(Value::as_str) != Some(entity_iid));
+                    if ents.len() != before {
+                        removed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if removed {
+            self.dirty = true;
+            Ok(())
+        } else {
+            bail!("entity instance '{entity_iid}' not found in level")
+        }
+    }
+
+    /// 4-connected flood fill on an IntGrid layer starting at `(cx, cy)`, replacing the
+    /// contiguous region sharing the start cell's value. Returns the number of cells filled.
+    pub fn flood_fill_intgrid(&mut self, r: LevelRef, layer_id: &str, cx: i64, cy: i64, value: i64) -> Result<usize> {
+        let filled;
+        {
+            let li = self.layer_instance_mut(r, layer_id)?;
+            if li.get("__type").and_then(Value::as_str) != Some("IntGrid") {
+                bail!("layer '{layer_id}' is not an IntGrid layer");
+            }
+            let cw = li.get("__cWid").and_then(Value::as_i64).unwrap_or(0);
+            let ch = li.get("__cHei").and_then(Value::as_i64).unwrap_or(0);
+            if cx < 0 || cy < 0 || cx >= cw || cy >= ch {
+                bail!("start cell ({cx},{cy}) is out of bounds for {cw}x{ch}");
+            }
+            let mut grid: Vec<i64> = li
+                .get("intGridCsv")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(0)).collect())
+                .unwrap_or_default();
+            let total = (cw * ch).max(0) as usize;
+            if grid.len() != total {
+                bail!("intGridCsv length {} != {cw}x{ch} = {total}", grid.len());
+            }
+            let target = grid[(cy * cw + cx) as usize];
+            let mut count = 0usize;
+            if target != value {
+                let mut stack = vec![(cx, cy)];
+                while let Some((x, y)) = stack.pop() {
+                    if x < 0 || y < 0 || x >= cw || y >= ch {
+                        continue;
+                    }
+                    let i = (y * cw + x) as usize;
+                    if grid[i] != target {
+                        continue;
+                    }
+                    grid[i] = value;
+                    count += 1;
+                    stack.push((x + 1, y));
+                    stack.push((x - 1, y));
+                    stack.push((x, y + 1));
+                    stack.push((x, y - 1));
+                }
+                li["intGridCsv"] = json!(grid);
+                li["autoLayerTiles"] = json!([]);
+            }
+            filled = count;
+        }
+        if filled > 0 {
+            self.dirty = true;
+        }
+        Ok(filled)
+    }
 }
 
 fn level_matches(lvl: &Value, key: &str) -> bool {
@@ -1529,6 +1653,128 @@ mod tests {
         // Addressable by iid too.
         assert_eq!(p.find_world("w-iid"), Some(0));
         assert!(p.set_world_layout("missing", Some("Free"), None, None).is_err());
+    }
+
+    #[test]
+    fn move_entity_recomputes_grid_and_px() {
+        let mut p = project(json!({
+            "defs": {
+                "entities": [{
+                    "uid": 3, "identifier": "Chest", "width": 16, "height": 16,
+                    "pivotX": 0.5, "pivotY": 1.0,
+                }],
+            },
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [{
+                    "__type": "Entities", "__identifier": "Entities", "__gridSize": 16,
+                    "entityInstances": [{
+                        "iid": "ent-1", "__identifier": "Chest", "__grid": [0, 0], "px": [8, 16],
+                    }],
+                }],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        p.move_entity(r, "ent-1", 3, 4).unwrap();
+        let e = p.entity_instance_ref(r, "ent-1").unwrap();
+        assert_eq!(e.get("__grid"), Some(&json!([3, 4])));
+        // px = cx*grid + pivot*grid: x = 3*16 + 0.5*16 = 56, y = 4*16 + 1.0*16 = 80
+        assert_eq!(e.get("px"), Some(&json!([56, 80])));
+        assert!(p.dirty);
+        assert!(p.move_entity(r, "missing", 0, 0).is_err());
+    }
+
+    #[test]
+    fn delete_entity_removes_instance() {
+        let mut p = project(json!({
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [{
+                    "__type": "Entities", "__identifier": "Entities",
+                    "entityInstances": [
+                        { "iid": "a", "__identifier": "Chest" },
+                        { "iid": "b", "__identifier": "Mob" },
+                    ],
+                }],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        p.delete_entity(r, "a").unwrap();
+        assert!(p.entity_instance_ref(r, "a").is_none());
+        assert!(p.entity_instance_ref(r, "b").is_some());
+        assert!(p.delete_entity(r, "missing").is_err());
+    }
+
+    #[test]
+    fn flood_fill_intgrid_fills_bounded_region() {
+        // 4x4 grid, border of 1s, interior 0s:
+        // 1 1 1 1
+        // 1 0 0 1
+        // 1 0 0 1
+        // 1 1 1 1
+        let csv = vec![1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1];
+        let mut p = project(json!({
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [{
+                    "__type": "IntGrid", "__identifier": "Collisions",
+                    "__cWid": 4, "__cHei": 4, "__gridSize": 16,
+                    "intGridCsv": csv, "autoLayerTiles": [{ "px": [0, 0] }],
+                }],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        // Fill the interior (1,1) -> value 2: only the 4 interior cells.
+        let filled = p.flood_fill_intgrid(r, "Collisions", 1, 1, 2).unwrap();
+        assert_eq!(filled, 4);
+        let li = p.layer_instance_ref(r, "Collisions").unwrap();
+        let out: Vec<i64> = li["intGridCsv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        assert_eq!(out, vec![1, 1, 1, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 1, 1, 1]);
+        // AutoLayer tiles cleared for regeneration.
+        assert_eq!(li["autoLayerTiles"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn flood_fill_intgrid_noop_when_value_matches() {
+        let mut p = project(json!({
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [{
+                    "__type": "IntGrid", "__identifier": "Collisions",
+                    "__cWid": 2, "__cHei": 2, "__gridSize": 16,
+                    "intGridCsv": [5, 5, 5, 5], "autoLayerTiles": [{ "px": [0, 0] }],
+                }],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        let filled = p.flood_fill_intgrid(r, "Collisions", 0, 0, 5).unwrap();
+        assert_eq!(filled, 0);
+        // No-op leaves autoLayerTiles untouched.
+        let li = p.layer_instance_ref(r, "Collisions").unwrap();
+        assert_eq!(li["autoLayerTiles"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn flood_fill_intgrid_validates_layer_and_bounds() {
+        let mut p = project(json!({
+            "levels": [{
+                "identifier": "L",
+                "layerInstances": [
+                    { "__type": "Tiles", "__identifier": "Tiles", "__cWid": 2, "__cHei": 2,
+                      "__gridSize": 16, "intGridCsv": [] },
+                    { "__type": "IntGrid", "__identifier": "Collisions", "__cWid": 2, "__cHei": 2,
+                      "__gridSize": 16, "intGridCsv": [0, 0, 0, 0], "autoLayerTiles": [] },
+                ],
+            }],
+        }));
+        let r = p.find_level("L").unwrap();
+        assert!(p.flood_fill_intgrid(r, "Tiles", 0, 0, 1).is_err());
+        assert!(p.flood_fill_intgrid(r, "Collisions", 5, 5, 1).is_err());
     }
 
     #[test]

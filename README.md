@@ -37,7 +37,10 @@ Requires a recent stable Rust toolchain.
 | `create_world` | Create a new empty world (multi-world projects); appends to the root `worlds` array. |
 | `set_world_layout` | Update a world's layout and/or grid dimensions (`worldLayout`, `worldGridWidth/Height`). |
 | `set_intgrid` | Set an IntGrid layer via a full `csv` and/or rectangle fills. Clears AutoLayer tiles so LDtk regenerates them. |
+| `flood_fill_intgrid` | 4-connected flood fill on an IntGrid layer from a start cell, replacing the contiguous same-value region. |
 | `place_entities` | Place entity instances on an Entity layer using grid coordinates, with optional typed `fields`. |
+| `move_entity` | Move an existing entity instance (by iid) to a new grid cell; pixel position recomputed from the def pivot. |
+| `delete_entity` | Delete a single entity instance (by iid) from a level. |
 | `set_entity_fields` | Set typed field values on an existing entity instance (by iid). |
 | `set_level_fields` | Set typed custom field values on a level. |
 | `paint_tiles` | Paint tiles on a Tile layer by grid coordinate and tile id (pixel `src` computed from tileset geometry). |
