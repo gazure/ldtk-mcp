@@ -491,6 +491,48 @@ def test_define_from_scratch():
         s.close()
 
 
+def test_safety():
+    print("Safety: preview_changes / undo / redo / revert_unsaved (Typical_TopDown_example.ldtk)")
+    wd = workdir()
+    f = copy_into(wd, "Typical_TopDown_example.ldtk")
+    s = Session()
+    try:
+        assert s.call("open_project", {"path": f})[0] == "OK"
+        st, text = s.call("preview_changes", {})
+        check("preview clean before edits", st == "OK" and "matches the file on disk" in text, text[:200])
+
+        st, msg = s.call("create_level", {"identifier": "Safety_Test", "px_wid": 128, "px_hei": 128})
+        check("create_level", st == "OK", msg)
+        st, text = s.call("preview_changes", {})
+        check("preview lists added level", st == "OK" and "Safety_Test" in text and "added" in text, text[:300])
+
+        st, msg = s.call("undo", {})
+        check("undo runs", st == "OK", msg)
+        st, text = s.call("preview_changes", {})
+        check("preview clean after undo", st == "OK" and "matches the file on disk" in text, text[:200])
+
+        st, msg = s.call("redo", {})
+        check("redo runs", st == "OK", msg)
+        st, text = s.call("preview_changes", {})
+        check("preview lists level again after redo", st == "OK" and "Safety_Test" in text, text[:300])
+
+        st, msg = s.call("revert_unsaved", {})
+        check("revert_unsaved runs", st == "OK", msg)
+        st, listing = s.call("list_levels", {})
+        check("reverted level gone", st == "OK" and "Safety_Test" not in listing, listing[:200])
+        # Revert clears history, so there is nothing left to undo.
+        st, msg = s.call("undo", {})
+        check("undo empty after revert", st == "ERROR", msg)
+
+        # Nothing was saved, so the file on disk must be untouched.
+        check("save (no-op edits persisted)", s.call("save_project", {})[0] == "OK")
+    finally:
+        s.close()
+
+    saved = json.load(open(f))
+    check("file has no Safety_Test level", all(l["identifier"] != "Safety_Test" for l in saved["levels"]))
+
+
 def test_validate():
     print("Validation (Entities.ldtk)")
     wd = workdir()
@@ -517,6 +559,7 @@ if __name__ == "__main__":
     test_world_tools()
     test_flood_fill()
     test_define_from_scratch()
+    test_safety()
     test_validate()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

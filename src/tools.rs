@@ -472,6 +472,22 @@ impl LdtkServer {
         f(proj)
     }
 
+    /// Like `with_project`, but snapshots `root` for undo before running `f`. The snapshot is
+    /// kept only if `f` succeeds, so a tool that errors (e.g. failed validation) leaves no
+    /// spurious history. Used by every mutating tool.
+    fn with_project_mut<T>(&self, f: impl FnOnce(&mut Project) -> Result<T, ErrorData>) -> Result<T, ErrorData> {
+        let mut guard = self.state.lock().map_err(|_| err("state lock poisoned"))?;
+        let proj = guard
+            .as_mut()
+            .ok_or_else(|| err("no project open; call open_project first"))?;
+        let snapshot = proj.root.clone();
+        let result = f(proj);
+        if result.is_ok() {
+            proj.commit_undo(snapshot);
+        }
+        result
+    }
+
     #[tool(description = "Open a .ldtk project file for reading and editing. Must be called before other tools.")]
     fn open_project(&self, Parameters(args): Parameters<OpenArgs>) -> Result<String, ErrorData> {
         let proj = Project::load(&args.path).map_err(|e| err(format!("{e:#}")))?;
@@ -615,17 +631,17 @@ impl LdtkServer {
                 .map(|a| {
                     a.iter()
                         .map(|li| {
+                            let (intgrid_nonzero, grid_tiles, auto_tiles, entities) = crate::diff::layer_counts(li);
                             json!({
                                 "identifier": li.get("__identifier"),
                                 "type": li.get("__type"),
                                 "cWid": li.get("__cWid"),
                                 "cHei": li.get("__cHei"),
                                 "gridSize": li.get("__gridSize"),
-                                "entityCount": li.get("entityInstances").and_then(Value::as_array).map(|a| a.len()),
-                                "gridTileCount": li.get("gridTiles").and_then(Value::as_array).map(|a| a.len()),
-                                "autoTileCount": li.get("autoLayerTiles").and_then(Value::as_array).map(|a| a.len()),
-                                "intGridNonZero": li.get("intGridCsv").and_then(Value::as_array)
-                                    .map(|a| a.iter().filter(|v| v.as_i64() != Some(0)).count()),
+                                "entityCount": entities,
+                                "gridTileCount": grid_tiles,
+                                "autoTileCount": auto_tiles,
+                                "intGridNonZero": intgrid_nonzero,
                             })
                         })
                         .collect()
@@ -784,7 +800,7 @@ impl LdtkServer {
 
     #[tool(description = "Create a new empty level. Layer instances are generated from the project layer definitions.")]
     fn create_level(&self, Parameters(args): Parameters<CreateLevelArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let px_wid = args
                 .px_wid
                 .or_else(|| p.root.get("defaultLevelWidth").and_then(Value::as_i64))
@@ -811,7 +827,7 @@ impl LdtkServer {
         description = "Delete a level by identifier/iid/uid. For external-level projects the .ldtkl file is removed on save_project."
     )]
     fn delete_level(&self, Parameters(args): Parameters<DeleteLevelArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let iid = p.delete_level(&args.level).map_err(|e| err(format!("{e:#}")))?;
             Ok(format!(
                 "Deleted level '{}' (iid={}). Call save_project to persist.",
@@ -824,7 +840,7 @@ impl LdtkServer {
         description = "Duplicate a level (deep copy with fresh uid/iids), placed at the next free world position. Optionally name the copy."
     )]
     fn duplicate_level(&self, Parameters(args): Parameters<DuplicateLevelArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let level = p
                 .duplicate_level(&args.level, args.identifier.as_deref())
                 .map_err(|e| err(format!("{e:#}")))?;
@@ -840,7 +856,7 @@ impl LdtkServer {
 
     #[tool(description = "Move a level to a new world-space pixel position (worldX/worldY).")]
     fn move_level(&self, Parameters(args): Parameters<MoveLevelArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             p.move_level(&args.level, args.world_x, args.world_y)
                 .map_err(|e| err(format!("{e:#}")))?;
             Ok(format!(
@@ -854,7 +870,7 @@ impl LdtkServer {
         description = "Resize a level. Layer instances are reflowed: IntGrid is resized, and tiles/entities outside the new bounds are clipped."
     )]
     fn resize_level(&self, Parameters(args): Parameters<ResizeLevelArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             p.resize_level(&args.level, args.px_wid, args.px_hei)
                 .map_err(|e| err(format!("{e:#}")))?;
             Ok(format!(
@@ -866,7 +882,7 @@ impl LdtkServer {
 
     #[tool(description = "Create a new (empty) world in a multi-world project. Appends to the root `worlds` array.")]
     fn create_world(&self, Parameters(args): Parameters<CreateWorldArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let root_has_levels = p
                 .root
                 .get("levels")
@@ -902,7 +918,7 @@ impl LdtkServer {
         description = "Update a world's layout and/or grid dimensions (worldLayout, worldGridWidth, worldGridHeight)."
     )]
     fn set_world_layout(&self, Parameters(args): Parameters<SetWorldLayoutArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             p.set_world_layout(
                 &args.world,
                 args.world_layout.as_deref(),
@@ -918,7 +934,7 @@ impl LdtkServer {
         description = "Move an existing entity instance (by iid) to a new grid cell. Pixel position is recomputed from the entity definition pivot."
     )]
     fn move_entity(&self, Parameters(args): Parameters<MoveEntityArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -933,7 +949,7 @@ impl LdtkServer {
 
     #[tool(description = "Delete a single entity instance (by iid) from a level.")]
     fn delete_entity(&self, Parameters(args): Parameters<DeleteEntityArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -950,7 +966,7 @@ impl LdtkServer {
         description = "Flood fill an IntGrid layer (4-connected) from a start cell, replacing the contiguous region that shares the start cell's value. AutoLayer tiles are cleared so LDtk regenerates them."
     )]
     fn flood_fill_intgrid(&self, Parameters(args): Parameters<FloodFillIntGridArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -968,7 +984,7 @@ impl LdtkServer {
         description = "Create a new layer definition (IntGrid/Entities/Tiles/AutoLayer) and backfill an empty instance into every existing level. For IntGrid, provide `int_grid_values`."
     )]
     fn create_layer_def(&self, Parameters(args): Parameters<CreateLayerDefArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let ig_values = args.int_grid_values.map(|vs| {
                 vs.into_iter()
                     .map(|s| {
@@ -1002,7 +1018,7 @@ impl LdtkServer {
         description = "Create a new entity definition. Provide `tileset_uid`+`tile_id` for tile rendering, otherwise it renders as a rectangle."
     )]
     fn create_entity_def(&self, Parameters(args): Parameters<CreateEntityDefArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let def = p
                 .create_entity_def(
                     &args.identifier,
@@ -1025,7 +1041,7 @@ impl LdtkServer {
 
     #[tool(description = "Create a new enum definition from a list of value identifiers.")]
     fn create_enum(&self, Parameters(args): Parameters<CreateEnumArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let def = p
                 .create_enum(&args.identifier, args.values.clone())
                 .map_err(|e| err(format!("{e:#}")))?;
@@ -1042,7 +1058,7 @@ impl LdtkServer {
         description = "Create a new tileset definition. Image dimensions (px_wid/px_hei) are explicit; no image decoding is performed."
     )]
     fn create_tileset_def(&self, Parameters(args): Parameters<CreateTilesetDefArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let def = p
                 .create_tileset_def(
                     &args.identifier,
@@ -1068,7 +1084,7 @@ impl LdtkServer {
         description = "Add a field definition to an existing entity definition. `field_type` is one of Int/Float/Bool/String/Multilines/FilePath/Color/Point/EntityRef/Tile/Enum (Enum requires `enum_id`)."
     )]
     fn add_entity_field(&self, Parameters(args): Parameters<AddEntityFieldArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let def = p
                 .add_entity_field(
                     &args.entity,
@@ -1094,7 +1110,7 @@ impl LdtkServer {
         description = "Add a field definition to the project-level `levelFields`. `field_type` is one of Int/Float/Bool/String/Multilines/FilePath/Color/Point/EntityRef/Tile/Enum (Enum requires `enum_id`)."
     )]
     fn add_level_field(&self, Parameters(args): Parameters<AddLevelFieldArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let def = p
                 .add_level_field(
                     &args.identifier,
@@ -1118,7 +1134,7 @@ impl LdtkServer {
         description = "Set the IntGrid of a layer. Provide a full `csv` (row-major, length cWid*cHei) and/or `rects` to fill regions. AutoLayer tiles are cleared so LDtk regenerates them on load."
     )]
     fn set_intgrid(&self, Parameters(args): Parameters<SetIntGridArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -1178,7 +1194,7 @@ impl LdtkServer {
         description = "Place entity instances on an Entity layer. Coordinates are grid cells; pixel position is derived from the entity definition pivot."
     )]
     fn place_entities(&self, Parameters(args): Parameters<PlaceEntitiesArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -1265,7 +1281,7 @@ impl LdtkServer {
         description = "Set typed field values on an existing entity instance (identified by its iid). Fields are encoded against the entity definition."
     )]
     fn set_entity_fields(&self, Parameters(args): Parameters<SetEntityFieldsArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -1297,7 +1313,7 @@ impl LdtkServer {
 
     #[tool(description = "Set typed custom field values on a level (encoded against the project's levelFields).")]
     fn set_level_fields(&self, Parameters(args): Parameters<SetLevelFieldsArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -1323,7 +1339,7 @@ impl LdtkServer {
         description = "Paint tiles on a Tile layer by grid coordinate and tile id. Pixel src is computed from the tileset geometry."
     )]
     fn paint_tiles(&self, Parameters(args): Parameters<PaintTilesArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -1385,7 +1401,7 @@ impl LdtkServer {
 
     #[tool(description = "Remove tiles from a Tile layer, either entirely or within a grid rectangle.")]
     fn clear_tiles(&self, Parameters(args): Parameters<ClearTilesArgs>) -> Result<String, ErrorData> {
-        self.with_project(|p| {
+        self.with_project_mut(|p| {
             let idx = p
                 .find_level(&args.level)
                 .ok_or_else(|| err(format!("level '{}' not found", args.level)))?;
@@ -1503,6 +1519,66 @@ impl LdtkServer {
         })
     }
 
+    #[tool(
+        description = "Preview unsaved edits: a semantic diff of the in-memory project vs the .ldtk file on disk (levels added/removed/modified, per-layer content deltas, definition changes). Read-only; call before save_project."
+    )]
+    fn preview_changes(&self) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let (disk, note) = match p.disk_root() {
+                Ok(root) => (root, String::new()),
+                Err(e) => (
+                    json!({}),
+                    format!("(no readable on-disk version: {e:#}; everything below reads as new)\n"),
+                ),
+            };
+            let changes = crate::diff::summarize(&disk, &p.root);
+            if changes.is_empty() {
+                return Ok(format!("{note}In-memory state matches the file on disk."));
+            }
+            let shown: Vec<String> = changes.iter().take(40).cloned().collect();
+            let more = changes.len().saturating_sub(shown.len());
+            let tail = if more > 0 {
+                format!("\n… (+{more} more)")
+            } else {
+                String::new()
+            };
+            Ok(format!(
+                "{note}{} pending change(s) vs {}:\n{}{tail}",
+                changes.len(),
+                p.path.display(),
+                shown.join("\n"),
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Undo the most recent mutating tool call (in-memory). Edits remain unsaved until save_project. Up to 20 steps of history are kept."
+    )]
+    fn undo(&self) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            p.undo().map_err(|e| err(format!("{e:#}")))?;
+            Ok("Reverted the last change. Call save_project to persist, or redo to re-apply.".to_string())
+        })
+    }
+
+    #[tool(description = "Re-apply the most recently undone change (in-memory).")]
+    fn redo(&self) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            p.redo().map_err(|e| err(format!("{e:#}")))?;
+            Ok("Re-applied the change. Call save_project to persist.".to_string())
+        })
+    }
+
+    #[tool(
+        description = "Discard ALL unsaved edits by reloading the project from disk. Clears undo/redo history; this cannot itself be undone."
+    )]
+    fn revert_unsaved(&self) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            p.revert().map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!("Discarded unsaved edits; reloaded {}.", p.path.display()))
+        })
+    }
+
     #[tool(description = "Write the in-memory project back to its .ldtk file on disk.")]
     fn save_project(&self) -> Result<String, ErrorData> {
         self.with_project(|p| {
@@ -1522,7 +1598,8 @@ impl ServerHandler for LdtkServer {
             capabilities: rmcp::model::ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(
                 "Edit LDtk (.ldtk) projects to generate game levels. \
-                 Workflow: open_project -> describe_defs -> create_level / set_intgrid / place_entities -> validate_project -> save_project. \
+                 Workflow: open_project -> describe_defs -> create_level / set_intgrid / place_entities -> preview_changes -> validate_project -> save_project. \
+                 Edits stay in memory until save_project; use preview_changes to review pending edits, and undo / revert_unsaved to recover from mistakes. \
                  For tile visuals, edit the IntGrid that drives an AutoLayer rather than painting tiles directly."
                     .to_string(),
             ),
