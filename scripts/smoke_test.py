@@ -5,6 +5,7 @@ Covers: level creation + IntGrid, typed entity fields, level fields, tile painti
 separate level files (.ldtkl) round-trip, and multi-world editing.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -77,6 +78,18 @@ class Session:
         if "error" in resp:
             return ("ERROR", resp["error"]["message"])
         return ("OK", resp["result"]["content"][0]["text"])
+
+    def rpc(self, method, params):
+        """Raw JSON-RPC request; returns the full response dict (result or error)."""
+        self._id += 1
+        return self._send(
+            {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params},
+            True,
+        )
+
+    def call_full(self, name, args):
+        """tools/call returning the full result dict (for inspecting non-text content)."""
+        return self.rpc("tools/call", {"name": name, "arguments": args})
 
     def close(self):
         self.proc.stdin.close()
@@ -780,6 +793,67 @@ def test_safety():
     )
 
 
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def test_render_and_resources():
+    print("Visual feedback: render_level + tileset resources (Typical_TopDown_example.ldtk)")
+    wd = workdir()
+    f = copy_into(wd, "Typical_TopDown_example.ldtk")
+    # The atlas images live in the nested support dir; place them beside the .ldtk so the
+    # relative tileset relPaths (atlas/...) resolve, mirroring the external-levels test.
+    shutil.copytree(os.path.join(SUPPORT, "atlas"), os.path.join(wd, "atlas"))
+    proj = json.load(open(f))
+    level = proj["levels"][0]["identifier"]
+    s = Session()
+    try:
+        assert s.call("open_project", {"path": f})[0] == "OK"
+
+        resp = s.call_full("render_level", {"level": level, "max_px": 512})
+        ok = "result" in resp
+        check("render_level runs", ok, resp.get("error"))
+        if ok:
+            content = resp["result"]["content"]
+            note = next((c for c in content if c.get("type") == "text"), None)
+            image = next((c for c in content if c.get("type") == "image"), None)
+            check("render note present", note is not None and "Rendered" in note.get("text", ""), note)
+            check("image content returned", image is not None and image.get("mimeType") == "image/png", image)
+            if image:
+                raw = base64.b64decode(image["data"])
+                check("image is a valid PNG", raw[:8] == PNG_MAGIC, raw[:8])
+                check("image is non-trivial", len(raw) > 100, len(raw))
+
+        # Layer filter: rendering a single layer still produces a valid PNG.
+        ig = find_layer(proj, "IntGrid")
+        if ig:
+            resp = s.call_full("render_level", {"level": level, "layers": [ig], "scale": 1})
+            img = next((c for c in resp.get("result", {}).get("content", []) if c.get("type") == "image"), None)
+            check("layer-filtered render returns PNG",
+                  img is not None and base64.b64decode(img["data"])[:8] == PNG_MAGIC, img is not None)
+
+        # Tileset images are exposed as resources.
+        listing = s.rpc("resources/list", {})
+        uris = [r["uri"] for r in listing.get("result", {}).get("resources", [])]
+        tileset_uri = next((u for u in uris if u.startswith("ldtk://tileset/")), None)
+        check("resources/list exposes a tileset", tileset_uri is not None, uris)
+        if tileset_uri:
+            read = s.rpc("resources/read", {"uri": tileset_uri})
+            contents = read.get("result", {}).get("contents", [])
+            blob = contents[0] if contents else {}
+            check("resources/read returns image blob",
+                  blob.get("mimeType") == "image/png" and "blob" in blob, blob.get("mimeType"))
+            if "blob" in blob:
+                check("tileset blob is a valid PNG", base64.b64decode(blob["blob"])[:8] == PNG_MAGIC)
+
+        # A level preview is also readable as a templated resource.
+        read = s.rpc("resources/read", {"uri": f"ldtk://level/{level}/preview.png"})
+        contents = read.get("result", {}).get("contents", [])
+        check("level preview resource renders a PNG",
+              bool(contents) and base64.b64decode(contents[0]["blob"])[:8] == PNG_MAGIC, read.get("error"))
+    finally:
+        s.close()
+
+
 def test_validate():
     print("Validation (Entities.ldtk)")
     wd = workdir()
@@ -807,6 +881,7 @@ if __name__ == "__main__":
     test_flood_fill()
     test_define_from_scratch()
     test_safety()
+    test_render_and_resources()
     test_validate()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

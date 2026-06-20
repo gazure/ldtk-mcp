@@ -5,15 +5,24 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use base64::Engine as _;
 use rmcp::{
     handler::server::wrapper::Parameters,
+    model::{
+        Annotated, CallToolResult, Content, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        RawResource, RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+    },
     schemars::{self, JsonSchema},
-    tool, tool_router, ErrorData, ServerHandler,
+    service::RequestContext,
+    tool, tool_router, ErrorData, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::project::Project;
+use crate::{
+    project::Project,
+    render::{self, RenderOpts},
+};
 
 #[derive(Clone)]
 pub struct LdtkServer {
@@ -451,6 +460,18 @@ pub struct AddLevelFieldArgs {
     pub max: Option<f64>,
     /// For `Enum` fields: the enum identifier to reference.
     pub enum_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RenderLevelArgs {
+    /// Level identifier, iid, or uid.
+    pub level: String,
+    /// Output pixels per source pixel. Overrides `max_px` when set.
+    pub scale: Option<f64>,
+    /// Cap for the longest output edge in pixels (when `scale` is omitted). Default 1024.
+    pub max_px: Option<i64>,
+    /// If set, render only the layers whose identifier is listed (bottom-to-top order preserved).
+    pub layers: Option<Vec<String>>,
 }
 
 // ---- Tool implementations --------------------------------------------------
@@ -1520,6 +1541,33 @@ impl LdtkServer {
     }
 
     #[tool(
+        description = "Render a level to a PNG and return it as an image (plus a text note). Draws IntGrid value colors, real tileset tiles, and entities; reflects the current in-memory edits. Use this to visually verify a level after editing."
+    )]
+    fn render_level(&self, Parameters(args): Parameters<RenderLevelArgs>) -> Result<CallToolResult, ErrorData> {
+        self.with_project(|p| {
+            let opts = RenderOpts {
+                scale: args.scale,
+                max_px: args.max_px.unwrap_or(1024),
+                layers: args.layers,
+            };
+            let out = render::render_level(p, &args.level, &opts).map_err(|e| err(format!("{e:#}")))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&out.png);
+            let mut note = format!(
+                "Rendered '{}' at {}x{}px (scale {:.3}).",
+                args.level, out.width, out.height, out.scale
+            );
+            if !out.warnings.is_empty() {
+                note.push_str("\nWarnings:\n- ");
+                note.push_str(&out.warnings.join("\n- "));
+            }
+            Ok(CallToolResult::success(vec![
+                Content::text(note),
+                Content::image(b64, "image/png"),
+            ]))
+        })
+    }
+
+    #[tool(
         description = "Preview unsaved edits: a semantic diff of the in-memory project vs the .ldtk file on disk (levels added/removed/modified, per-layer content deltas, definition changes). Read-only; call before save_project."
     )]
     fn preview_changes(&self) -> Result<String, ErrorData> {
@@ -1588,21 +1636,139 @@ impl LdtkServer {
     }
 }
 
+/// MIME type for a tileset image by extension. `None` for formats we don't serve as images
+/// (e.g. `.aseprite`), so they're excluded from the resource list.
+fn image_mime(rel: &str) -> Option<&'static str> {
+    let lower = rel.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        Some("image/png")
+    } else if lower.ends_with(".gif") {
+        Some("image/gif")
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+// ---- Resource backends (used by the ServerHandler impl) --------------------
+
+impl LdtkServer {
+    /// One `ldtk://tileset/{uid}` resource per tileset def with a servable image file.
+    fn resource_list(&self) -> Result<ListResourcesResult, ErrorData> {
+        let guard = self.state.lock().map_err(|_| err("state lock poisoned"))?;
+        let mut resources = Vec::new();
+        if let Some(p) = guard.as_ref() {
+            if let Some(tilesets) = p
+                .root
+                .get("defs")
+                .and_then(|d| d.get("tilesets"))
+                .and_then(Value::as_array)
+            {
+                for t in tilesets {
+                    let (Some(uid), Some(rel)) = (
+                        t.get("uid").and_then(Value::as_i64),
+                        t.get("relPath").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    let Some(mime) = image_mime(rel) else { continue };
+                    let ident = t.get("identifier").and_then(Value::as_str).unwrap_or("tileset");
+                    let mut raw = RawResource::new(format!("ldtk://tileset/{uid}"), format!("{ident} ({rel})"));
+                    raw.mime_type = Some(mime.to_string());
+                    resources.push(Annotated::new(raw, None));
+                }
+            }
+        }
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    fn resource_templates(&self) -> ListResourceTemplatesResult {
+        let templates = vec![
+            Annotated::new(RawResourceTemplate::new("ldtk://tileset/{uid}", "Tileset image"), None),
+            Annotated::new(
+                RawResourceTemplate::new("ldtk://level/{level}/preview.png", "Level preview PNG"),
+                None,
+            ),
+        ];
+        ListResourceTemplatesResult::with_all_items(templates)
+    }
+
+    fn resource_read(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+        let guard = self.state.lock().map_err(|_| err("state lock poisoned"))?;
+        let p = guard
+            .as_ref()
+            .ok_or_else(|| err("no project open; call open_project first"))?;
+
+        if let Some(rest) = uri.strip_prefix("ldtk://tileset/") {
+            let uid: i64 = rest.parse().map_err(|_| err(format!("bad tileset uri '{uri}'")))?;
+            let rel = p
+                .tileset_rel_path(uid)
+                .ok_or_else(|| err(format!("tileset {uid} has no image path")))?;
+            let mime = image_mime(&rel).unwrap_or("application/octet-stream");
+            let path = p.resolve_rel_path(&rel);
+            let bytes = std::fs::read(&path).map_err(|e| err(format!("reading {}: {e}", path.display())))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let contents = ResourceContents::blob(b64, uri.to_string()).with_mime_type(mime);
+            return Ok(ReadResourceResult::new(vec![contents]));
+        }
+
+        if let Some(rest) = uri.strip_prefix("ldtk://level/") {
+            let key = rest
+                .strip_suffix("/preview.png")
+                .ok_or_else(|| err(format!("bad level uri '{uri}'")))?;
+            let out = render::render_level(p, key, &RenderOpts::default()).map_err(|e| err(format!("{e:#}")))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(out.png);
+            let contents = ResourceContents::blob(b64, uri.to_string()).with_mime_type("image/png");
+            return Ok(ReadResourceResult::new(vec![contents]));
+        }
+
+        Err(err(format!("unknown resource uri '{uri}'")))
+    }
+}
+
 #[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for LdtkServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        // Advertise the `tools` capability during the handshake. Without this,
-        // clients won't issue `tools/list` and the server appears to expose 0 tools
-        // even though the tool router is wired up.
+        // Advertise the `tools` and `resources` capabilities during the handshake. Without this,
+        // clients won't issue `tools/list` or `resources/list` and the server appears empty.
         rmcp::model::ServerInfo::new(
-            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
         )
         .with_instructions(
             "Edit LDtk (.ldtk) projects to generate game levels. \
-             Workflow: open_project -> describe_defs -> create_level / set_intgrid / place_entities -> preview_changes -> validate_project -> save_project. \
-             Edits stay in memory until save_project; use preview_changes to review pending edits, and undo / revert_unsaved to recover from mistakes. \
+             Workflow: open_project -> describe_defs -> create_level / set_intgrid / place_entities -> render_level -> preview_changes -> validate_project -> save_project. \
+             Edits stay in memory until save_project; use render_level to see a level, preview_changes to review pending edits, and undo / revert_unsaved to recover from mistakes. \
+             Tileset images are exposed as ldtk://tileset/{uid} resources. \
              For tile visuals, edit the IntGrid that drives an AutoLayer rather than painting tiles directly.",
         )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        self.resource_list()
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(self.resource_templates())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        self.resource_read(&request.uri)
     }
 }
 

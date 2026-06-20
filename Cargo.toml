@@ -21,3 +21,5 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonschema = { version = "0.46.5", default-features = false }
+png = "0.17"
+base64 = "0.22"
