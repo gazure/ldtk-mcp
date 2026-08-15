@@ -52,6 +52,9 @@ Requires a recent stable Rust toolchain.
 | `add_entity_field` | Append a typed field definition to an existing entity def (Enum fields resolve `enum_id`). |
 | `add_level_field` | Append a typed field definition to the project-level `levelFields`. |
 | `validate_project` | Authoritative structural checks plus best-effort JSON-schema warnings. |
+| `preview_changes` | Semantic diff of in-memory edits vs the file on disk; review before saving. |
+| `undo` / `redo` | Step backward/forward through mutating edits (in-memory; up to 20 steps). |
+| `revert_unsaved` | Discard all unsaved edits by reloading from disk. |
 | `save_project` | Write the in-memory project (and any `.ldtkl` files) back to disk. |
 
 ### Typed fields
@@ -65,10 +68,22 @@ the field def is an array.
 
 Edits stay in memory until you call `save_project`.
 
+### Safety: preview, undo, revert
+
+Every mutating tool automatically snapshots the project first, so edits are reversible:
+
+- `preview_changes` shows a semantic diff of the in-memory project against the `.ldtk` file on
+  disk (levels added/removed/modified, per-layer content-count deltas, definition changes) — call
+  it before `save_project` to review what will be written. For separate-level-file projects the
+  on-disk `.ldtkl` bodies are reloaded so per-layer content is compared accurately.
+- `undo` / `redo` walk an in-memory history (up to 20 steps). Undone edits stay unsaved until you
+  `save_project` again.
+- `revert_unsaved` discards all unsaved edits by reloading from disk (and clears the history).
+
 ### Recommended workflow
 
 `open_project` → `describe_defs` → `create_level` → `set_intgrid` / `place_entities` →
-`validate_project` → `save_project`.
+`preview_changes` → `validate_project` → `save_project`.
 
 For tile visuals, prefer editing the **IntGrid** that drives an **AutoLayer** rather than painting
 tiles directly — LDtk renders the tiles from the rules automatically on load.

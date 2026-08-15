@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
+/// Maximum number of pre-mutation snapshots retained for undo; oldest are evicted.
+const UNDO_CAP: usize = 20;
+
 /// A loaded LDtk project plus the path it came from.
 pub struct Project {
     pub path: PathBuf,
@@ -16,6 +19,10 @@ pub struct Project {
     pub dirty: bool,
     /// Relative `.ldtkl` paths whose levels were deleted in memory; unlinked on `save`.
     pub pending_external_deletes: Vec<String>,
+    /// Pre-mutation `root` snapshots, newest last; capped at `UNDO_CAP`.
+    undo_stack: Vec<Value>,
+    /// States popped by `undo`, available for `redo`; cleared on any new commit.
+    redo_stack: Vec<Value>,
 }
 
 /// Resolved info about a layer definition, used when building layer instances.
@@ -71,6 +78,8 @@ impl Project {
             root,
             dirty: false,
             pending_external_deletes: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         proj.merge_external_levels()?;
         Ok(proj)
@@ -180,6 +189,52 @@ impl Project {
         v
     }
 
+    // ---- Snapshot / rollback (Tier 5 safety) ------------------------------
+
+    /// Record a pre-mutation snapshot of `root` for undo. Evicts the oldest when over
+    /// `UNDO_CAP`, and clears the redo history (a new edit invalidates any redo branch).
+    pub fn commit_undo(&mut self, snapshot: Value) {
+        self.undo_stack.push(snapshot);
+        if self.undo_stack.len() > UNDO_CAP {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    /// Restore the most recent pre-mutation snapshot, moving the current state onto the
+    /// redo stack. Leaves the project dirty (in-memory state now differs from disk).
+    pub fn undo(&mut self) -> Result<()> {
+        let prev = self.undo_stack.pop().ok_or_else(|| anyhow!("nothing to undo"))?;
+        self.redo_stack.push(std::mem::replace(&mut self.root, prev));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Re-apply the most recently undone state, moving the current state back onto the
+    /// undo stack.
+    pub fn redo(&mut self) -> Result<()> {
+        let next = self.redo_stack.pop().ok_or_else(|| anyhow!("nothing to redo"))?;
+        self.undo_stack.push(std::mem::replace(&mut self.root, next));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// The project as it currently exists on disk, fully merged (external `.ldtkl` bodies
+    /// pulled in), by reloading from `path`. Used as the baseline for diffing and reverting.
+    pub fn disk_root(&self) -> Result<Value> {
+        Ok(Project::load(&self.path)?.root)
+    }
+
+    /// Discard all unsaved edits by reloading the on-disk state, clearing undo/redo history.
+    pub fn revert(&mut self) -> Result<()> {
+        self.root = self.disk_root()?;
+        self.pending_external_deletes.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.dirty = false;
+        Ok(())
+    }
+
     pub fn json_version(&self) -> String {
         self.root
             .get("jsonVersion")
@@ -216,6 +271,19 @@ impl Project {
 
     pub fn new_iid() -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Construct an in-memory project around a root value, for tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn from_root_for_test(root: Value) -> Self {
+        Self {
+            path: PathBuf::from("/tmp/test.ldtk"),
+            root,
+            dirty: false,
+            pending_external_deletes: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
     }
 
     fn defs(&self) -> Option<&Value> {
@@ -1627,6 +1695,8 @@ mod tests {
             root,
             dirty: false,
             pending_external_deletes: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -2340,5 +2410,50 @@ mod tests {
 
         // Enum without enum_id is rejected.
         assert!(p.add_level_field("z", "Enum", false, true, None, None, None).is_err());
+    }
+
+    // ---- Tier 5: snapshot / rollback --------------------------------------
+
+    #[test]
+    fn undo_redo_restore_root() {
+        let mut p = project(json!({ "v": 0 }));
+        // Simulate two edits, each snapshotting the prior state first.
+        p.commit_undo(p.root.clone());
+        p.root = json!({ "v": 1 });
+        p.commit_undo(p.root.clone());
+        p.root = json!({ "v": 2 });
+
+        p.undo().unwrap();
+        assert_eq!(p.root, json!({ "v": 1 }));
+        assert!(p.dirty);
+        p.undo().unwrap();
+        assert_eq!(p.root, json!({ "v": 0 }));
+        assert!(p.undo().is_err(), "stack should be empty");
+
+        // Redo walks back forward.
+        p.redo().unwrap();
+        assert_eq!(p.root, json!({ "v": 1 }));
+        p.redo().unwrap();
+        assert_eq!(p.root, json!({ "v": 2 }));
+        assert!(p.redo().is_err(), "nothing left to redo");
+    }
+
+    #[test]
+    fn commit_undo_caps_stack_and_clears_redo() {
+        let mut p = project(json!({ "n": 0 }));
+        // Push one more than the cap; oldest is evicted, so depth stays at UNDO_CAP.
+        for n in 0..(UNDO_CAP + 5) {
+            p.commit_undo(json!({ "n": n }));
+        }
+        assert_eq!(p.undo_stack.len(), UNDO_CAP);
+        // The oldest retained snapshot is n=5 (0..4 evicted).
+        assert_eq!(p.undo_stack.first(), Some(&json!({ "n": 5 })));
+
+        // A new commit clears any pending redo branch.
+        p.root = json!({ "n": 999 });
+        p.undo().unwrap();
+        assert!(!p.redo_stack.is_empty());
+        p.commit_undo(p.root.clone());
+        assert!(p.redo_stack.is_empty());
     }
 }

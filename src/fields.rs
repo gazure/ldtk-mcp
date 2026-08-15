@@ -375,17 +375,10 @@ fn parse_tile_rect(v: &Value) -> Option<(i64, i64, i64, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     fn project(root: Value) -> Project {
-        Project {
-            path: PathBuf::from("/tmp/test.ldtk"),
-            root,
-            dirty: false,
-            pending_external_deletes: Vec::new(),
-        }
+        Project::from_root_for_test(root)
     }
 
     #[test]
