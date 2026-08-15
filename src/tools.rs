@@ -1588,23 +1588,21 @@ impl LdtkServer {
     }
 }
 
-#[rmcp::tool_handler]
+#[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for LdtkServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo {
-            // Advertise the `tools` capability during the handshake. Without this,
-            // clients won't issue `tools/list` and the server appears to expose 0 tools
-            // even though the tool router is wired up.
-            capabilities: rmcp::model::ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some(
-                "Edit LDtk (.ldtk) projects to generate game levels. \
-                 Workflow: open_project -> describe_defs -> create_level / set_intgrid / place_entities -> preview_changes -> validate_project -> save_project. \
-                 Edits stay in memory until save_project; use preview_changes to review pending edits, and undo / revert_unsaved to recover from mistakes. \
-                 For tile visuals, edit the IntGrid that drives an AutoLayer rather than painting tiles directly."
-                    .to_string(),
-            ),
-            ..Default::default()
-        }
+        // Advertise the `tools` capability during the handshake. Without this,
+        // clients won't issue `tools/list` and the server appears to expose 0 tools
+        // even though the tool router is wired up.
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_instructions(
+            "Edit LDtk (.ldtk) projects to generate game levels. \
+             Workflow: open_project -> describe_defs -> create_level / set_intgrid / place_entities -> preview_changes -> validate_project -> save_project. \
+             Edits stay in memory until save_project; use preview_changes to review pending edits, and undo / revert_unsaved to recover from mistakes. \
+             For tile visuals, edit the IntGrid that drives an AutoLayer rather than painting tiles directly.",
+        )
     }
 }
 

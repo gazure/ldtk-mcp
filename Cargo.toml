@@ -10,7 +10,7 @@ name = "ldtk-mcp"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { version = "0.16", features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros", "schemars"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order keeps JSON key ordering stable so we don't churn the whole file on save
