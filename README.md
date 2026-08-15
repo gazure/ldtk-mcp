@@ -45,6 +45,12 @@ Requires a recent stable Rust toolchain.
 | `set_level_fields` | Set typed custom field values on a level. |
 | `paint_tiles` | Paint tiles on a Tile layer by grid coordinate and tile id (pixel `src` computed from tileset geometry). |
 | `clear_tiles` | Remove tiles from a Tile layer, entirely or within a grid rectangle. |
+| `create_layer_def` | Define a new layer (IntGrid/Entities/Tiles/AutoLayer) and backfill an empty instance into every level. |
+| `create_entity_def` | Define a new entity (size, color, tags); optional tileset tile binding for `Tile` rendering. |
+| `create_enum` | Define a new enum from a list of value identifiers. |
+| `create_tileset_def` | Define a new tileset from an image path + explicit dimensions (grid/padding/spacing). |
+| `add_entity_field` | Append a typed field definition to an existing entity def (Enum fields resolve `enum_id`). |
+| `add_level_field` | Append a typed field definition to the project-level `levelFields`. |
 | `validate_project` | Authoritative structural checks plus best-effort JSON-schema warnings. |
 | `save_project` | Write the in-memory project (and any `.ldtkl` files) back to disk. |
 

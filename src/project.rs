@@ -222,6 +222,31 @@ impl Project {
         self.root.get("defs")
     }
 
+    /// Ensure `defs.<key>` exists as an array and return it mutably.
+    fn defs_array_mut(&mut self, key: &str) -> Result<&mut Vec<Value>> {
+        let obj = self
+            .root
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("root is not an object"))?;
+        let defs = obj.entry("defs").or_insert_with(|| json!({}));
+        let defs_obj = defs.as_object_mut().ok_or_else(|| anyhow!("`defs` is not an object"))?;
+        let arr = defs_obj.entry(key).or_insert_with(|| json!([]));
+        arr.as_array_mut()
+            .ok_or_else(|| anyhow!("`defs.{key}` is not an array"))
+    }
+
+    /// True if any definition in `defs.<key>` has the given `identifier`.
+    fn def_identifier_exists(&self, key: &str, identifier: &str) -> bool {
+        self.defs()
+            .and_then(|d| d.get(key))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .any(|d| d.get("identifier").and_then(Value::as_str) == Some(identifier))
+            })
+            .unwrap_or(false)
+    }
+
     pub fn layer_defs(&self) -> Vec<LayerDef> {
         let mut out = Vec::new();
         let Some(layers) = self.defs().and_then(|d| d.get("layers")).and_then(Value::as_array) else {
@@ -473,6 +498,382 @@ impl Project {
             "gridTiles": [],
             "entityInstances": []
         })
+    }
+
+    /// Create a new layer definition and backfill an empty instance into every level.
+    pub fn create_layer_def(
+        &mut self,
+        identifier: &str,
+        kind: &str,
+        grid_size: Option<i64>,
+        tileset_def_uid: Option<i64>,
+        int_grid_values: Option<Vec<Value>>,
+    ) -> Result<Value> {
+        if !matches!(kind, "IntGrid" | "Entities" | "Tiles" | "AutoLayer") {
+            bail!("invalid layer type '{kind}' (expected IntGrid, Entities, Tiles, or AutoLayer)");
+        }
+        if self.def_identifier_exists("layers", identifier) {
+            bail!("a layer def '{identifier}' already exists");
+        }
+        let grid = grid_size
+            .or_else(|| self.root.get("defaultGridSize").and_then(Value::as_i64))
+            .unwrap_or(16);
+        let ig_values: Vec<Value> = int_grid_values
+            .unwrap_or_default()
+            .iter()
+            .map(|v| {
+                json!({
+                    "value": v.get("value").and_then(Value::as_i64).unwrap_or(1),
+                    "identifier": v.get("identifier").cloned().unwrap_or(Value::Null),
+                    "color": v.get("color").and_then(Value::as_str).unwrap_or("#FFFFFF"),
+                    "groupUid": 0,
+                    "tile": Value::Null,
+                })
+            })
+            .collect();
+        // AutoLayer binds its tileset via autoTilesetDefUid; Tiles via tilesetDefUid.
+        let (tileset_field, auto_tileset_field) = match kind {
+            "AutoLayer" => (Value::Null, tileset_def_uid.map(Value::from).unwrap_or(Value::Null)),
+            _ => (tileset_def_uid.map(Value::from).unwrap_or(Value::Null), Value::Null),
+        };
+        let uid = self.alloc_uid()?;
+        let def = json!({
+            "__type": kind,
+            "type": kind,
+            "identifier": identifier,
+            "uid": uid,
+            "gridSize": grid,
+            "guideGridWid": 0,
+            "guideGridHei": 0,
+            "displayOpacity": 1.0,
+            "inactiveOpacity": 1.0,
+            "hideInList": false,
+            "hideFieldsWhenInactive": true,
+            "canSelectWhenInactive": true,
+            "renderInWorldView": true,
+            "useAsyncRender": false,
+            "pxOffsetX": 0,
+            "pxOffsetY": 0,
+            "parallaxFactorX": 0.0,
+            "parallaxFactorY": 0.0,
+            "parallaxScaling": true,
+            "tilePivotX": 0.0,
+            "tilePivotY": 0.0,
+            "intGridValues": ig_values,
+            "intGridValuesGroups": [],
+            "autoRuleGroups": [],
+            "autoSourceLayerDefUid": Value::Null,
+            "tilesetDefUid": tileset_field,
+            "autoTilesetDefUid": auto_tileset_field,
+            "requiredTags": [],
+            "excludedTags": [],
+            "uiFilterTags": [],
+            "doc": Value::Null,
+        });
+        self.defs_array_mut("layers")?.push(def.clone());
+        self.backfill_layer_def(uid)?;
+        self.dirty = true;
+        Ok(def)
+    }
+
+    /// Append an empty instance of the given layer def to every existing level.
+    fn backfill_layer_def(&mut self, layer_uid: i64) -> Result<()> {
+        let def = self
+            .layer_defs()
+            .into_iter()
+            .find(|d| d.uid == layer_uid)
+            .ok_or_else(|| anyhow!("layer def {layer_uid} not found after insert"))?;
+        for r in self.all_level_refs() {
+            let (level_uid, px_wid, px_hei) = {
+                let lvl = self.level_ref(r).unwrap();
+                (
+                    lvl.get("uid").and_then(Value::as_i64).unwrap_or(0),
+                    lvl.get("pxWid").and_then(Value::as_i64).unwrap_or(0),
+                    lvl.get("pxHei").and_then(Value::as_i64).unwrap_or(0),
+                )
+            };
+            let inst = self.empty_layer_instance(&def, level_uid, px_wid, px_hei);
+            let lvl = self.level_value_mut(r)?;
+            if let Some(arr) = lvl.get_mut("layerInstances").and_then(Value::as_array_mut) {
+                arr.push(inst);
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a new entity definition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_entity_def(
+        &mut self,
+        identifier: &str,
+        width: Option<i64>,
+        height: Option<i64>,
+        color: Option<String>,
+        tags: Option<Vec<String>>,
+        tileset_uid: Option<i64>,
+        tile_id: Option<i64>,
+    ) -> Result<Value> {
+        if self.def_identifier_exists("entities", identifier) {
+            bail!("an entity def '{identifier}' already exists");
+        }
+        let w = width.unwrap_or(16);
+        let h = height.unwrap_or(16);
+        let color = color.unwrap_or_else(|| "#94D9B3".to_string());
+        let tags = tags.unwrap_or_default();
+        let (render_mode, tile_rect) = match (tileset_uid, tile_id) {
+            (Some(ts), Some(tid)) => {
+                let [x, y] = self
+                    .tile_src(ts, tid)
+                    .ok_or_else(|| anyhow!("tileset {ts} not found"))?;
+                ("Tile", json!({ "tilesetUid": ts, "x": x, "y": y, "w": w, "h": h }))
+            }
+            _ => ("Rectangle", Value::Null),
+        };
+        let uid = self.alloc_uid()?;
+        let def = json!({
+            "identifier": identifier,
+            "uid": uid,
+            "tags": tags,
+            "width": w,
+            "height": h,
+            "resizableX": false,
+            "resizableY": false,
+            "keepAspectRatio": false,
+            "tileOpacity": 1.0,
+            "fillOpacity": 0.08,
+            "lineOpacity": 1.0,
+            "hollow": false,
+            "color": color,
+            "renderMode": render_mode,
+            "showName": true,
+            "tilesetId": tileset_uid.map(Value::from).unwrap_or(Value::Null),
+            "tileRenderMode": "FitInside",
+            "tileRect": tile_rect,
+            "nineSliceBorders": [],
+            "maxCount": 0,
+            "limitScope": "PerLevel",
+            "limitBehavior": "MoveLastOne",
+            "pivotX": 0.0,
+            "pivotY": 0.0,
+            "fieldDefs": [],
+            "doc": Value::Null,
+            "exportToToc": false,
+            "allowOutOfBounds": false,
+        });
+        self.defs_array_mut("entities")?.push(def.clone());
+        self.dirty = true;
+        Ok(def)
+    }
+
+    /// Create a new enum definition from a list of value identifiers.
+    pub fn create_enum(&mut self, identifier: &str, values: Vec<String>) -> Result<Value> {
+        if self.def_identifier_exists("enums", identifier) {
+            bail!("an enum '{identifier}' already exists");
+        }
+        let uid = self.alloc_uid()?;
+        let vals: Vec<Value> = values
+            .iter()
+            .map(|v| json!({ "id": v, "color": 0, "tileRect": Value::Null }))
+            .collect();
+        let def = json!({
+            "identifier": identifier,
+            "uid": uid,
+            "values": vals,
+            "iconTilesetUid": Value::Null,
+            "externalRelPath": Value::Null,
+            "externalFileChecksum": Value::Null,
+            "tags": [],
+        });
+        self.defs_array_mut("enums")?.push(def.clone());
+        self.dirty = true;
+        Ok(def)
+    }
+
+    /// Create a new tileset definition. Image dimensions are explicit (no decoding).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_tileset_def(
+        &mut self,
+        identifier: &str,
+        rel_path: &str,
+        px_wid: i64,
+        px_hei: i64,
+        tile_grid_size: Option<i64>,
+        padding: Option<i64>,
+        spacing: Option<i64>,
+    ) -> Result<Value> {
+        if self.def_identifier_exists("tilesets", identifier) {
+            bail!("a tileset def '{identifier}' already exists");
+        }
+        let grid = tile_grid_size.unwrap_or(16);
+        let pad = padding.unwrap_or(0);
+        let sp = spacing.unwrap_or(0);
+        // Inverse of `tile_src` geometry.
+        let c_wid = (px_wid - 2 * pad + sp) / (grid + sp);
+        let c_hei = (px_hei - 2 * pad + sp) / (grid + sp);
+        let uid = self.alloc_uid()?;
+        let def = json!({
+            "__cWid": c_wid.max(0),
+            "__cHei": c_hei.max(0),
+            "identifier": identifier,
+            "uid": uid,
+            "relPath": rel_path,
+            "embedAtlas": Value::Null,
+            "pxWid": px_wid,
+            "pxHei": px_hei,
+            "tileGridSize": grid,
+            "spacing": sp,
+            "padding": pad,
+            "tags": [],
+            "tagsSourceEnumUid": Value::Null,
+            "enumTags": [],
+            "customData": [],
+            "savedSelections": [],
+            "cachedPixelData": Value::Null,
+        });
+        self.defs_array_mut("tilesets")?.push(def.clone());
+        self.dirty = true;
+        Ok(def)
+    }
+
+    /// Look up an enum definition's uid by identifier.
+    fn enum_uid(&self, identifier: &str) -> Option<i64> {
+        self.defs()?
+            .get("enums")?
+            .as_array()?
+            .iter()
+            .find(|e| e.get("identifier").and_then(Value::as_str) == Some(identifier))
+            .and_then(|e| e.get("uid").and_then(Value::as_i64))
+    }
+
+    /// Build a FieldDef JSON value populated with schema-required editor defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn build_field_def(
+        &mut self,
+        identifier: &str,
+        field_type: &str,
+        is_array: bool,
+        can_be_null: bool,
+        min: Option<f64>,
+        max: Option<f64>,
+        enum_id: Option<&str>,
+    ) -> Result<Value> {
+        let (internal, display): (String, String) = match field_type {
+            "Int" => ("F_Int".into(), "Int".into()),
+            "Float" => ("F_Float".into(), "Float".into()),
+            "Bool" => ("F_Bool".into(), "Bool".into()),
+            "String" => ("F_String".into(), "String".into()),
+            "Multilines" => ("F_Text".into(), "String".into()),
+            "FilePath" => ("F_Path".into(), "FilePath".into()),
+            "Color" => ("F_Color".into(), "Color".into()),
+            "Point" => ("F_Point".into(), "Point".into()),
+            "EntityRef" => ("F_EntityRef".into(), "EntityRef".into()),
+            "Tile" => ("F_Tile".into(), "Tile".into()),
+            "Enum" => {
+                let eid = enum_id.ok_or_else(|| anyhow!("enum field '{identifier}' requires enum_id"))?;
+                let uid = self.enum_uid(eid).ok_or_else(|| anyhow!("enum '{eid}' not found"))?;
+                (format!("F_Enum({uid})"), eid.to_string())
+            }
+            other => bail!("unsupported field_type '{other}'"),
+        };
+        let uid = self.alloc_uid()?;
+        Ok(json!({
+            "identifier": identifier,
+            "uid": uid,
+            "type": internal,
+            "__type": display,
+            "isArray": is_array,
+            "canBeNull": can_be_null,
+            "arrayMinLength": Value::Null,
+            "arrayMaxLength": Value::Null,
+            "min": min.map(Value::from).unwrap_or(Value::Null),
+            "max": max.map(Value::from).unwrap_or(Value::Null),
+            "regex": Value::Null,
+            "acceptFileTypes": Value::Null,
+            "defaultOverride": Value::Null,
+            "textLanguageMode": Value::Null,
+            "editorDisplayMode": "NameAndValue",
+            "editorDisplayPos": "Above",
+            "editorDisplayScale": 1.0,
+            "editorDisplayColor": Value::Null,
+            "editorAlwaysShow": false,
+            "editorCutLongValues": true,
+            "editorShowInWorld": true,
+            "editorTextSuffix": Value::Null,
+            "editorTextPrefix": Value::Null,
+            "editorLinkStyle": "StraightArrow",
+            "useForSmartColor": false,
+            "allowedRefs": "OnlySame",
+            "allowedRefsEntityUid": Value::Null,
+            "allowedRefTags": [],
+            "allowOutOfLevelRef": true,
+            "symmetricalRef": false,
+            "tilesetUid": Value::Null,
+            "autoChainRef": true,
+            "doc": Value::Null,
+            "exportToToc": false,
+            "searchable": false,
+        }))
+    }
+
+    /// Append a field definition to an existing entity def (by identifier).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_entity_field(
+        &mut self,
+        entity: &str,
+        identifier: &str,
+        field_type: &str,
+        is_array: bool,
+        can_be_null: bool,
+        min: Option<f64>,
+        max: Option<f64>,
+        enum_id: Option<&str>,
+    ) -> Result<Value> {
+        if !self.def_identifier_exists("entities", entity) {
+            bail!("entity def '{entity}' not found");
+        }
+        if self.entity_field_def(entity, identifier).is_ok() {
+            bail!("entity '{entity}' already has a field '{identifier}'");
+        }
+        let def = self.build_field_def(identifier, field_type, is_array, can_be_null, min, max, enum_id)?;
+        let ents = self
+            .root
+            .get_mut("defs")
+            .and_then(|d| d.get_mut("entities"))
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| anyhow!("no entity defs"))?;
+        let ent = ents
+            .iter_mut()
+            .find(|e| e.get("identifier").and_then(Value::as_str) == Some(entity))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("entity def '{entity}' not found"))?;
+        ent.entry("fieldDefs")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("entity '{entity}' `fieldDefs` is not an array"))?
+            .push(def.clone());
+        self.dirty = true;
+        Ok(def)
+    }
+
+    /// Append a field definition to the project-level `defs.levelFields`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_level_field(
+        &mut self,
+        identifier: &str,
+        field_type: &str,
+        is_array: bool,
+        can_be_null: bool,
+        min: Option<f64>,
+        max: Option<f64>,
+        enum_id: Option<&str>,
+    ) -> Result<Value> {
+        if self.def_identifier_exists("levelFields", identifier) {
+            bail!("a level field '{identifier}' already exists");
+        }
+        let def = self.build_field_def(identifier, field_type, is_array, can_be_null, min, max, enum_id)?;
+        self.defs_array_mut("levelFields")?.push(def.clone());
+        self.dirty = true;
+        Ok(def)
     }
 
     /// Decide where a newly created level should live: root, or the first world in
@@ -1789,5 +2190,155 @@ mod tests {
         assert!(p.layer_instance_ref(r, "Collisions").is_some());
         assert!(p.layer_instance_ref(r, "layer-iid").is_some());
         assert!(p.layer_instance_ref(r, "nope").is_none());
+    }
+
+    // ---- Tier 3: definition authoring -------------------------------------
+
+    #[test]
+    fn create_layer_def_intgrid_and_backfill() {
+        let mut p = project(json!({
+            "nextUid": 50,
+            "defaultGridSize": 16,
+            "defs": { "layers": [] },
+            "levels": [
+                { "identifier": "L1", "uid": 1, "pxWid": 32, "pxHei": 32, "layerInstances": [] }
+            ],
+        }));
+        let def = p
+            .create_layer_def(
+                "Walls",
+                "IntGrid",
+                None,
+                None,
+                Some(vec![json!({ "value": 1, "identifier": "wall", "color": "#FF0000" })]),
+            )
+            .unwrap();
+        assert_eq!(def.get("__type").and_then(Value::as_str), Some("IntGrid"));
+        assert_eq!(def.get("gridSize").and_then(Value::as_i64), Some(16));
+        let igv = def.get("intGridValues").and_then(Value::as_array).unwrap();
+        assert_eq!(igv.len(), 1);
+        assert_eq!(igv[0].get("value").and_then(Value::as_i64), Some(1));
+        assert_eq!(igv[0].get("identifier").and_then(Value::as_str), Some("wall"));
+        assert_eq!(igv[0].get("groupUid").and_then(Value::as_i64), Some(0));
+        assert!(p.dirty);
+
+        // Backfilled into the existing level.
+        let r = p.find_level("L1").unwrap();
+        let li = p.layer_instance_ref(r, "Walls").unwrap();
+        assert_eq!(li.get("__type").and_then(Value::as_str), Some("IntGrid"));
+        assert_eq!(li.get("__cWid").and_then(Value::as_i64), Some(2));
+        assert_eq!(li.get("intGridCsv").and_then(Value::as_array).unwrap().len(), 4);
+
+        // Duplicate identifier and invalid type are rejected.
+        assert!(p.create_layer_def("Walls", "Tiles", None, None, None).is_err());
+        assert!(p.create_layer_def("Bogus", "Nope", None, None, None).is_err());
+    }
+
+    #[test]
+    fn create_entity_def_tile_vs_rectangle() {
+        let mut p = project(sample_defs());
+        let rect = p
+            .create_entity_def("Mob", Some(8), Some(8), None, None, None, None)
+            .unwrap();
+        assert_eq!(rect.get("renderMode").and_then(Value::as_str), Some("Rectangle"));
+        assert!(rect.get("tileRect").unwrap().is_null());
+        assert_eq!(rect.get("width").and_then(Value::as_i64), Some(8));
+
+        let tiled = p
+            .create_entity_def(
+                "Door",
+                None,
+                None,
+                Some("#00FF00".into()),
+                Some(vec!["solid".into()]),
+                Some(9),
+                Some(5),
+            )
+            .unwrap();
+        assert_eq!(tiled.get("renderMode").and_then(Value::as_str), Some("Tile"));
+        let tr = tiled.get("tileRect").unwrap();
+        assert_eq!(tr.get("tilesetUid").and_then(Value::as_i64), Some(9));
+        // tile 5 in the sample tileset -> (19, 19); default size 16.
+        assert_eq!(tr.get("x").and_then(Value::as_i64), Some(19));
+        assert_eq!(tr.get("y").and_then(Value::as_i64), Some(19));
+        assert_eq!(tr.get("w").and_then(Value::as_i64), Some(16));
+
+        assert!(p.create_entity_def("Mob", None, None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn create_enum_builds_values() {
+        let mut p = project(sample_defs());
+        let def = p
+            .create_enum("Direction", vec!["North".into(), "South".into()])
+            .unwrap();
+        let vals = def.get("values").and_then(Value::as_array).unwrap();
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0].get("id").and_then(Value::as_str), Some("North"));
+        assert_eq!(vals[0].get("color").and_then(Value::as_i64), Some(0));
+        assert!(def.get("tags").and_then(Value::as_array).unwrap().is_empty());
+        assert!(p.create_enum("Direction", vec![]).is_err());
+    }
+
+    #[test]
+    fn create_tileset_def_computes_grid() {
+        let mut p = project(sample_defs());
+        // 64x48 image, grid 16, no padding/spacing -> 4x3 cells.
+        let def = p
+            .create_tileset_def("Atlas", "atlas.png", 64, 48, None, None, None)
+            .unwrap();
+        assert_eq!(def.get("__cWid").and_then(Value::as_i64), Some(4));
+        assert_eq!(def.get("__cHei").and_then(Value::as_i64), Some(3));
+        // padding 1, spacing 2: (66 - 2 + 2) / (16 + 2) = 3.
+        let def2 = p
+            .create_tileset_def("Atlas2", "a2.png", 66, 66, Some(16), Some(1), Some(2))
+            .unwrap();
+        assert_eq!(def2.get("__cWid").and_then(Value::as_i64), Some(3));
+        assert!(p
+            .create_tileset_def("Atlas", "x.png", 16, 16, None, None, None)
+            .is_err());
+    }
+
+    #[test]
+    fn add_entity_field_roundtrips_through_encode() {
+        let mut p = project(sample_defs());
+        let def = p
+            .add_entity_field("Chest", "hp", "Int", false, false, Some(0.0), Some(100.0), None)
+            .unwrap();
+        assert_eq!(def.get("type").and_then(Value::as_str), Some("F_Int"));
+
+        let fd = crate::fields::parse_field_def(&def).unwrap();
+        let encoded = p.encode_field(&fd, &json!(150)).unwrap();
+        // Clamped to the max.
+        assert_eq!(encoded.get("__value").and_then(Value::as_i64), Some(100));
+
+        assert!(p.entity_field_def("Chest", "hp").is_ok());
+        // Duplicate field and unknown entity are rejected.
+        assert!(p
+            .add_entity_field("Chest", "hp", "Int", false, true, None, None, None)
+            .is_err());
+        assert!(p
+            .add_entity_field("Ghost", "x", "Int", false, true, None, None, None)
+            .is_err());
+    }
+
+    #[test]
+    fn add_level_field_enum_resolves_uid() {
+        let mut p = project(sample_defs());
+        let en = p.create_enum("Biome", vec!["Forest".into(), "Desert".into()]).unwrap();
+        let uid = en.get("uid").and_then(Value::as_i64).unwrap();
+        let def = p
+            .add_level_field("biome", "Enum", false, true, None, None, Some("Biome"))
+            .unwrap();
+        let expected = format!("F_Enum({uid})");
+        assert_eq!(def.get("type").and_then(Value::as_str), Some(expected.as_str()));
+        assert_eq!(def.get("__type").and_then(Value::as_str), Some("Biome"));
+
+        let fd = crate::fields::parse_field_def(&def).unwrap();
+        assert!(p.encode_field(&fd, &json!("Forest")).is_ok());
+        assert!(p.encode_field(&fd, &json!("Tundra")).is_err());
+
+        // Enum without enum_id is rejected.
+        assert!(p.add_level_field("z", "Enum", false, true, None, None, None).is_err());
     }
 }

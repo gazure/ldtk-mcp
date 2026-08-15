@@ -346,6 +346,113 @@ pub struct FloodFillIntGridArgs {
     pub value: i64,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct IntGridValueSpec {
+    /// The IntGrid value (1-based, matching LDtk).
+    pub value: i64,
+    /// Optional human-readable identifier for the value.
+    pub identifier: Option<String>,
+    /// Optional hex color (e.g. `#FF0000`). Defaults to `#FFFFFF`.
+    pub color: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateLayerDefArgs {
+    /// Unique identifier for the new layer definition.
+    pub identifier: String,
+    /// Layer type: `IntGrid`, `Entities`, `Tiles`, or `AutoLayer`.
+    #[serde(rename = "type")]
+    pub layer_type: String,
+    /// Grid size in pixels. Defaults to the project's `defaultGridSize` or 16.
+    pub grid_size: Option<i64>,
+    /// Tileset def uid to bind (`Tiles`/`AutoLayer` layers).
+    pub tileset_def_uid: Option<i64>,
+    /// For `IntGrid` layers: the value definitions to populate.
+    pub int_grid_values: Option<Vec<IntGridValueSpec>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateEntityDefArgs {
+    /// Unique identifier for the new entity definition.
+    pub identifier: String,
+    /// Pixel width. Default 16.
+    pub width: Option<i64>,
+    /// Pixel height. Default 16.
+    pub height: Option<i64>,
+    /// Base color as hex (e.g. `#94D9B3`). Default `#94D9B3`.
+    pub color: Option<String>,
+    /// Tags classifying this entity.
+    pub tags: Option<Vec<String>>,
+    /// Tileset def uid for tile rendering (requires `tile_id`).
+    pub tileset_uid: Option<i64>,
+    /// Tile id within the tileset (requires `tileset_uid`); enables `Tile` render mode.
+    pub tile_id: Option<i64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateEnumArgs {
+    /// Unique identifier for the new enum.
+    pub identifier: String,
+    /// Enum value identifiers.
+    pub values: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateTilesetDefArgs {
+    /// Unique identifier for the new tileset definition.
+    pub identifier: String,
+    /// Path to the image file, relative to the project JSON.
+    pub rel_path: String,
+    /// Image width in pixels.
+    pub px_wid: i64,
+    /// Image height in pixels.
+    pub px_hei: i64,
+    /// Tile grid size in pixels. Default 16.
+    pub tile_grid_size: Option<i64>,
+    /// Padding in pixels from image borders. Default 0.
+    pub padding: Option<i64>,
+    /// Spacing in pixels between tiles. Default 0.
+    pub spacing: Option<i64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AddEntityFieldArgs {
+    /// Entity definition identifier to add the field to.
+    pub entity: String,
+    /// Unique identifier for the new field.
+    pub identifier: String,
+    /// Field type: `Int`, `Float`, `Bool`, `String`, `Multilines`, `FilePath`, `Color`, `Point`, `EntityRef`, `Tile`, or `Enum`.
+    pub field_type: String,
+    /// If true, the field holds an array of values. Default false.
+    pub is_array: Option<bool>,
+    /// If true, the value can be null. Default true.
+    pub can_be_null: Option<bool>,
+    /// Optional min limit (Int/Float).
+    pub min: Option<f64>,
+    /// Optional max limit (Int/Float).
+    pub max: Option<f64>,
+    /// For `Enum` fields: the enum identifier to reference.
+    pub enum_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AddLevelFieldArgs {
+    /// Unique identifier for the new field.
+    pub identifier: String,
+    /// Field type: `Int`, `Float`, `Bool`, `String`, `Multilines`, `FilePath`, `Color`, `Point`, `EntityRef`, `Tile`, or `Enum`.
+    pub field_type: String,
+    /// If true, the field holds an array of values. Default false.
+    pub is_array: Option<bool>,
+    /// If true, the value can be null. Default true.
+    pub can_be_null: Option<bool>,
+    /// Optional min limit (Int/Float).
+    pub min: Option<f64>,
+    /// Optional max limit (Int/Float).
+    pub max: Option<f64>,
+    /// For `Enum` fields: the enum identifier to reference.
+    pub enum_id: Option<String>,
+}
+
 // ---- Tool implementations --------------------------------------------------
 
 #[tool_router]
@@ -853,6 +960,156 @@ impl LdtkServer {
             Ok(format!(
                 "Flood filled {} cell(s) on '{}' from ({}, {}) with value {}. Call save_project to persist.",
                 filled, args.layer, args.cx, args.cy, args.value
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Create a new layer definition (IntGrid/Entities/Tiles/AutoLayer) and backfill an empty instance into every existing level. For IntGrid, provide `int_grid_values`."
+    )]
+    fn create_layer_def(&self, Parameters(args): Parameters<CreateLayerDefArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let ig_values = args.int_grid_values.map(|vs| {
+                vs.into_iter()
+                    .map(|s| {
+                        json!({
+                            "value": s.value,
+                            "identifier": s.identifier,
+                            "color": s.color,
+                        })
+                    })
+                    .collect::<Vec<Value>>()
+            });
+            let def = p
+                .create_layer_def(
+                    &args.identifier,
+                    &args.layer_type,
+                    args.grid_size,
+                    args.tileset_def_uid,
+                    ig_values,
+                )
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Created {} layer def '{}' (uid={}) and backfilled all levels. Call save_project to persist.",
+                args.layer_type,
+                args.identifier,
+                def.get("uid").and_then(Value::as_i64).unwrap_or(0),
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Create a new entity definition. Provide `tileset_uid`+`tile_id` for tile rendering, otherwise it renders as a rectangle."
+    )]
+    fn create_entity_def(&self, Parameters(args): Parameters<CreateEntityDefArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let def = p
+                .create_entity_def(
+                    &args.identifier,
+                    args.width,
+                    args.height,
+                    args.color,
+                    args.tags,
+                    args.tileset_uid,
+                    args.tile_id,
+                )
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Created entity def '{}' (uid={}, renderMode={}). Call save_project to persist.",
+                args.identifier,
+                def.get("uid").and_then(Value::as_i64).unwrap_or(0),
+                def.get("renderMode").and_then(Value::as_str).unwrap_or(""),
+            ))
+        })
+    }
+
+    #[tool(description = "Create a new enum definition from a list of value identifiers.")]
+    fn create_enum(&self, Parameters(args): Parameters<CreateEnumArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let def = p
+                .create_enum(&args.identifier, args.values.clone())
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Created enum '{}' (uid={}) with {} value(s). Call save_project to persist.",
+                args.identifier,
+                def.get("uid").and_then(Value::as_i64).unwrap_or(0),
+                args.values.len(),
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Create a new tileset definition. Image dimensions (px_wid/px_hei) are explicit; no image decoding is performed."
+    )]
+    fn create_tileset_def(&self, Parameters(args): Parameters<CreateTilesetDefArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let def = p
+                .create_tileset_def(
+                    &args.identifier,
+                    &args.rel_path,
+                    args.px_wid,
+                    args.px_hei,
+                    args.tile_grid_size,
+                    args.padding,
+                    args.spacing,
+                )
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Created tileset def '{}' (uid={}, {}x{} grid). Call save_project to persist.",
+                args.identifier,
+                def.get("uid").and_then(Value::as_i64).unwrap_or(0),
+                def.get("__cWid").and_then(Value::as_i64).unwrap_or(0),
+                def.get("__cHei").and_then(Value::as_i64).unwrap_or(0),
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Add a field definition to an existing entity definition. `field_type` is one of Int/Float/Bool/String/Multilines/FilePath/Color/Point/EntityRef/Tile/Enum (Enum requires `enum_id`)."
+    )]
+    fn add_entity_field(&self, Parameters(args): Parameters<AddEntityFieldArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let def = p
+                .add_entity_field(
+                    &args.entity,
+                    &args.identifier,
+                    &args.field_type,
+                    args.is_array.unwrap_or(false),
+                    args.can_be_null.unwrap_or(true),
+                    args.min,
+                    args.max,
+                    args.enum_id.as_deref(),
+                )
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Added field '{}' (type={}) to entity '{}'. Call save_project to persist.",
+                args.identifier,
+                def.get("type").and_then(Value::as_str).unwrap_or(""),
+                args.entity,
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Add a field definition to the project-level `levelFields`. `field_type` is one of Int/Float/Bool/String/Multilines/FilePath/Color/Point/EntityRef/Tile/Enum (Enum requires `enum_id`)."
+    )]
+    fn add_level_field(&self, Parameters(args): Parameters<AddLevelFieldArgs>) -> Result<String, ErrorData> {
+        self.with_project(|p| {
+            let def = p
+                .add_level_field(
+                    &args.identifier,
+                    &args.field_type,
+                    args.is_array.unwrap_or(false),
+                    args.can_be_null.unwrap_or(true),
+                    args.min,
+                    args.max,
+                    args.enum_id.as_deref(),
+                )
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "Added level field '{}' (type={}). Call save_project to persist.",
+                args.identifier,
+                def.get("type").and_then(Value::as_str).unwrap_or(""),
             ))
         })
     }

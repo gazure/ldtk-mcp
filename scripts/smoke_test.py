@@ -407,6 +407,90 @@ def test_flood_fill():
         s.close()
 
 
+def test_define_from_scratch():
+    print("Definition authoring (Entities.ldtk)")
+    wd = workdir()
+    f = copy_into(wd, "Entities.ldtk")
+    proj = json.load(open(f))
+    # An existing Entities layer to place our new entity on.
+    ent_layer = find_layer(proj, "Entities")
+    s = Session()
+    try:
+        assert s.call("open_project", {"path": f})[0] == "OK"
+
+        st, msg = s.call("create_tileset_def", {
+            "identifier": "T3_Atlas", "rel_path": "atlas3.png",
+            "px_wid": 64, "px_hei": 64, "tile_grid_size": 16,
+        })
+        check("create_tileset_def", st == "OK", msg)
+
+        st, msg = s.call("create_enum", {"identifier": "T3_Loot", "values": ["Gold", "Gems"]})
+        check("create_enum", st == "OK", msg)
+
+        # Look up the new tileset uid for the entity tile binding.
+        st, defs = s.call("describe_defs", {})
+        ts_uid = None
+        if st == "OK":
+            ts = next((t for t in json.loads(defs)["tilesets"] if t["identifier"] == "T3_Atlas"), None)
+            ts_uid = ts["uid"] if ts else None
+        check("new tileset visible in describe_defs", ts_uid is not None, defs[:200])
+
+        st, msg = s.call("create_entity_def", {
+            "identifier": "T3_Pickup", "width": 16, "height": 16,
+            "tileset_uid": ts_uid, "tile_id": 0,
+        })
+        check("create_entity_def (tile)", st == "OK", msg)
+
+        st, msg = s.call("create_layer_def", {
+            "identifier": "T3_Walls", "type": "IntGrid",
+            "int_grid_values": [{"value": 1, "identifier": "wall", "color": "#FF0000"}],
+        })
+        check("create_layer_def (IntGrid)", st == "OK", msg)
+
+        # New levels must include the backfilled layer; so must existing ones.
+        st, msg = s.call("create_level", {"identifier": "T3_Level", "px_wid": 64, "px_hei": 64})
+        check("create_level", st == "OK", msg)
+        st, lvl = s.call("get_level", {"level": "T3_Level"})
+        if st == "OK":
+            layers = json.loads(lvl)["layers"]
+            walls = next((L for L in layers if L["identifier"] == "T3_Walls"), None)
+            check("new layer backfilled into new level", walls is not None and walls["type"] == "IntGrid", layers)
+
+        # Add a field to the new entity and prove the encode path works end to end.
+        st, msg = s.call("add_entity_field", {
+            "entity": "T3_Pickup", "identifier": "loot", "field_type": "Enum", "enum_id": "T3_Loot",
+        })
+        check("add_entity_field (enum)", st == "OK", msg)
+
+        st, msg = s.call("place_entities", {
+            "level": "T3_Level", "layer": ent_layer,
+            "entities": [{"identifier": "T3_Pickup", "cx": 1, "cy": 1, "fields": {"loot": "Gold"}}],
+        })
+        check("place_entities w/ new entity+field", st == "OK", msg)
+        st, listing = s.call("get_entities", {"level": "T3_Level", "layer": ent_layer})
+        if st == "OK":
+            ents = [e for grp in json.loads(listing) for e in grp["entities"]]
+            pickup = next((e for e in ents if e["identifier"] == "T3_Pickup"), None)
+            check("placed entity decodes enum field",
+                  pickup is not None and pickup["fields"].get("loot") == "Gold", listing[:300])
+
+        # Invalid enum value should be rejected by the encode path.
+        st, msg = s.call("place_entities", {
+            "level": "T3_Level", "layer": ent_layer,
+            "entities": [{"identifier": "T3_Pickup", "cx": 2, "cy": 2, "fields": {"loot": "Diamond"}}],
+        })
+        check("invalid enum value rejected", st == "ERROR", msg)
+
+        # Everything we authored should still validate cleanly against the schema.
+        st, text = s.call("validate_project", {})
+        check("validate runs", st == "OK", text)
+        check("no structural issues", "no structural issues" in text, text[:300])
+        check("no schema warnings", "no warnings" in text, text[:400])
+        check("save", s.call("save_project", {})[0] == "OK")
+    finally:
+        s.close()
+
+
 def test_validate():
     print("Validation (Entities.ldtk)")
     wd = workdir()
@@ -432,6 +516,7 @@ if __name__ == "__main__":
     test_level_lifecycle()
     test_world_tools()
     test_flood_fill()
+    test_define_from_scratch()
     test_validate()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
