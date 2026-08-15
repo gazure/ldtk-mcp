@@ -4,7 +4,13 @@
 Covers: level creation + IntGrid, typed entity fields, level fields, tile painting,
 separate level files (.ldtkl) round-trip, and multi-world editing.
 """
-import json, os, shutil, subprocess, sys, tempfile
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -29,12 +35,25 @@ def check(name, cond, detail=""):
 class Session:
     def __init__(self):
         self.proc = subprocess.Popen(
-            [BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True,
+            [BIN],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
         )
-        self._send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                               "clientInfo": {"name": "smoke", "version": "0"}}}, True)
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "smoke", "version": "0"},
+                },
+            },
+            True,
+        )
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"}, False)
         self._id = 1
 
@@ -46,8 +65,15 @@ class Session:
 
     def call(self, name, args):
         self._id += 1
-        resp = self._send({"jsonrpc": "2.0", "id": self._id, "method": "tools/call",
-                           "params": {"name": name, "arguments": args}}, True)
+        resp = self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": self._id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": args},
+            },
+            True,
+        )
         if "error" in resp:
             return ("ERROR", resp["error"]["message"])
         return ("OK", resp["result"]["content"][0]["text"])
@@ -92,30 +118,56 @@ def test_typed_entity_fields():
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
-        status, msg = s.call("place_entities", {
-            "level": level, "layer": "GameEntities",
-            "entities": [{"identifier": "Chest", "cx": 5, "cy": 5,
-                          "fields": {"content": ["Gold", "Trout"], "requireKey": True}}],
-        })
+        status, msg = s.call(
+            "place_entities",
+            {
+                "level": level,
+                "layer": "GameEntities",
+                "entities": [
+                    {
+                        "identifier": "Chest",
+                        "cx": 5,
+                        "cy": 5,
+                        "fields": {"content": ["Gold", "Trout"], "requireKey": True},
+                    }
+                ],
+            },
+        )
         check("place_entities w/ fields", status == "OK", msg)
         # Read the entities back through the new query-depth tool before saving.
-        status, listing = s.call("get_entities", {"level": level, "layer": "GameEntities"})
+        status, listing = s.call(
+            "get_entities", {"level": level, "layer": "GameEntities"}
+        )
         check("get_entities runs", status == "OK", listing)
         if status == "OK":
             data = json.loads(listing)
             ents = [e for grp in data for e in grp["entities"]]
-            chest = next((e for e in ents if e["identifier"] == "Chest" and e["cx"] == 5 and e["cy"] == 5), None)
+            chest = next(
+                (
+                    e
+                    for e in ents
+                    if e["identifier"] == "Chest" and e["cx"] == 5 and e["cy"] == 5
+                ),
+                None,
+            )
             check("get_entities returns placed chest", chest is not None, listing[:200])
             if chest:
-                check("get_entities decodes content field",
-                      chest["fields"].get("content") == ["Gold", "Trout"], chest["fields"])
+                check(
+                    "get_entities decodes content field",
+                    chest["fields"].get("content") == ["Gold", "Trout"],
+                    chest["fields"],
+                )
                 check("get_entities exposes iid", bool(chest.get("iid")), chest)
         # Tier 2.5 single-instance ops: operate on a throwaway entity so the (5,5)
         # Chest stays intact for the on-disk field assertions below.
-        s.call("place_entities", {
-            "level": level, "layer": "GameEntities",
-            "entities": [{"identifier": "Chest", "cx": 1, "cy": 1}],
-        })
+        s.call(
+            "place_entities",
+            {
+                "level": level,
+                "layer": "GameEntities",
+                "entities": [{"identifier": "Chest", "cx": 1, "cy": 1}],
+            },
+        )
         st, listing = s.call("get_entities", {"level": level, "layer": "GameEntities"})
         tmp = None
         if st == "OK":
@@ -123,12 +175,18 @@ def test_typed_entity_fields():
             tmp = next((e for e in ents if e["cx"] == 1 and e["cy"] == 1), None)
         if tmp and tmp.get("iid"):
             iid = tmp["iid"]
-            st, msg = s.call("move_entity", {"level": level, "entity_iid": iid, "cx": 8, "cy": 9})
+            st, msg = s.call(
+                "move_entity", {"level": level, "entity_iid": iid, "cx": 8, "cy": 9}
+            )
             check("move_entity", st == "OK", msg)
             st, got = s.call("get_entity", {"level": level, "entity_iid": iid})
             if st == "OK":
                 g = json.loads(got)
-                check("move_entity updates grid", g["cx"] == 8 and g["cy"] == 9, (g.get("cx"), g.get("cy")))
+                check(
+                    "move_entity updates grid",
+                    g["cx"] == 8 and g["cy"] == 9,
+                    (g.get("cx"), g.get("cy")),
+                )
             st, msg = s.call("delete_entity", {"level": level, "entity_iid": iid})
             check("delete_entity", st == "OK", msg)
             st, got = s.call("get_entity", {"level": level, "entity_iid": iid})
@@ -139,18 +197,34 @@ def test_typed_entity_fields():
 
     saved = json.load(open(f))
     lvl = next(l for l in saved["levels"] if l["identifier"] == level)
-    ents = next(li for li in lvl["layerInstances"] if li["__identifier"] == "GameEntities")["entityInstances"]
-    chest = next(e for e in ents if e["__grid"] == [5, 5] and e["__identifier"] == "Chest")
+    ents = next(
+        li for li in lvl["layerInstances"] if li["__identifier"] == "GameEntities"
+    )["entityInstances"]
+    chest = next(
+        e for e in ents if e["__grid"] == [5, 5] and e["__identifier"] == "Chest"
+    )
     fields = {fi["__identifier"]: fi for fi in chest["fieldInstances"]}
-    check("content __value", fields["content"]["__value"] == ["Gold", "Trout"], fields["content"]["__value"])
-    check("content realEditorValues",
-          fields["content"]["realEditorValues"] == [
-              {"id": "V_String", "params": ["Gold"]}, {"id": "V_String", "params": ["Trout"]}],
-          fields["content"]["realEditorValues"])
+    check(
+        "content __value",
+        fields["content"]["__value"] == ["Gold", "Trout"],
+        fields["content"]["__value"],
+    )
+    check(
+        "content realEditorValues",
+        fields["content"]["realEditorValues"]
+        == [
+            {"id": "V_String", "params": ["Gold"]},
+            {"id": "V_String", "params": ["Trout"]},
+        ],
+        fields["content"]["realEditorValues"],
+    )
     check("requireKey __value", fields["requireKey"]["__value"] is True)
-    check("requireKey realEditorValues",
-          fields["requireKey"]["realEditorValues"] == [{"id": "V_Bool", "params": [True]}],
-          fields["requireKey"]["realEditorValues"])
+    check(
+        "requireKey realEditorValues",
+        fields["requireKey"]["realEditorValues"]
+        == [{"id": "V_Bool", "params": [True]}],
+        fields["requireKey"]["realEditorValues"],
+    )
 
 
 def test_paint_tiles():
@@ -174,10 +248,15 @@ def test_paint_tiles():
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
-        status, msg = s.call("paint_tiles", {
-            "level": level, "layer": layer, "replace": True,
-            "tiles": [{"cx": 0, "cy": 0, "t": 0}, {"cx": 1, "cy": 0, "t": 1}],
-        })
+        status, msg = s.call(
+            "paint_tiles",
+            {
+                "level": level,
+                "layer": layer,
+                "replace": True,
+                "tiles": [{"cx": 0, "cy": 0, "t": 0}, {"cx": 1, "cy": 0, "t": 1}],
+            },
+        )
         check("paint_tiles", status == "OK", msg)
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
@@ -185,10 +264,15 @@ def test_paint_tiles():
 
     saved = json.load(open(f))
     lvl = next(l for l in saved["levels"] if l["identifier"] == level)
-    tiles = next(li for li in lvl["layerInstances"] if li["__identifier"] == layer)["gridTiles"]
+    tiles = next(li for li in lvl["layerInstances"] if li["__identifier"] == layer)[
+        "gridTiles"
+    ]
     check("two tiles painted", len(tiles) == 2, len(tiles))
     check("tile ids", sorted(t["t"] for t in tiles) == [0, 1])
-    check("tile has src/px/d", all(len(t["src"]) == 2 and len(t["px"]) == 2 and "d" in t for t in tiles))
+    check(
+        "tile has src/px/d",
+        all(len(t["src"]) == 2 and len(t["px"]) == 2 and "d" in t for t in tiles),
+    )
 
 
 def test_external_levels():
@@ -197,7 +281,10 @@ def test_external_levels():
     f = copy_into(wd, "SeparateLevelFiles.ldtk")
     # The .ldtkl bodies live in the nested support dir; place them beside the .ldtk
     # so the relative externalRelPath resolves.
-    shutil.copytree(os.path.join(SUPPORT, "SeparateLevelFiles"), os.path.join(wd, "SeparateLevelFiles"))
+    shutil.copytree(
+        os.path.join(SUPPORT, "SeparateLevelFiles"),
+        os.path.join(wd, "SeparateLevelFiles"),
+    )
     proj = json.load(open(f))
     level = proj["levels"][0]["identifier"]
     ext_rel = proj["levels"][0]["externalRelPath"]
@@ -208,20 +295,31 @@ def test_external_levels():
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
-        status, msg = s.call("set_intgrid", {
-            "level": level, "layer": intgrid,
-            "rects": [{"cx": 0, "cy": 0, "w": 3, "h": 3, "value": 1}],
-        })
+        status, msg = s.call(
+            "set_intgrid",
+            {
+                "level": level,
+                "layer": intgrid,
+                "rects": [{"cx": 0, "cy": 0, "w": 3, "h": 3, "value": 1}],
+            },
+        )
         check("set_intgrid on external level", status == "OK", msg)
         # Read the IntGrid back and confirm the fill round-trips.
         status, grid = s.call("get_intgrid", {"level": level, "layer": intgrid})
         check("get_intgrid runs", status == "OK", grid)
         if status == "OK":
             g = json.loads(grid)
-            check("get_intgrid round-trips fill", sum(1 for v in g["csv"] if v != 0) >= 9, sum(1 for v in g["csv"] if v != 0))
+            check(
+                "get_intgrid round-trips fill",
+                sum(1 for v in g["csv"] if v != 0) >= 9,
+                sum(1 for v in g["csv"] if v != 0),
+            )
             check("get_intgrid reports dimensions", g["cWid"] > 0 and g["cHei"] > 0, g)
         # Delete a separate external level; its body should be removed on save.
-        check("victim .ldtkl exists before delete", os.path.exists(os.path.join(wd, victim_rel)))
+        check(
+            "victim .ldtkl exists before delete",
+            os.path.exists(os.path.join(wd, victim_rel)),
+        )
         status, msg = s.call("delete_level", {"level": victim})
         check("delete external level", status == "OK", msg)
         check("save", s.call("save_project", {})[0] == "OK")
@@ -231,12 +329,22 @@ def test_external_levels():
     main = json.load(open(f))
     main_lvl = next(l for l in main["levels"] if l["identifier"] == level)
     check("main file layerInstances nulled", main_lvl["layerInstances"] is None)
-    check("deleted level gone from main", all(l["identifier"] != victim for l in main["levels"]))
-    check("deleted .ldtkl unlinked on save", not os.path.exists(os.path.join(wd, victim_rel)), victim_rel)
+    check(
+        "deleted level gone from main",
+        all(l["identifier"] != victim for l in main["levels"]),
+    )
+    check(
+        "deleted .ldtkl unlinked on save",
+        not os.path.exists(os.path.join(wd, victim_rel)),
+        victim_rel,
+    )
     body = json.load(open(os.path.join(wd, ext_rel)))
     li = next(x for x in body["layerInstances"] if x["__identifier"] == intgrid)
-    check(".ldtkl intGrid updated", sum(1 for v in li["intGridCsv"] if v != 0) >= 9,
-          sum(1 for v in li["intGridCsv"] if v != 0))
+    check(
+        ".ldtkl intGrid updated",
+        sum(1 for v in li["intGridCsv"] if v != 0) >= 9,
+        sum(1 for v in li["intGridCsv"] if v != 0),
+    )
 
 
 def find_multi_world_sample():
@@ -284,10 +392,14 @@ def test_multi_world():
         assert s.call("open_project", {"path": f})[0] == "OK"
         status, listing = s.call("list_levels", {})
         check("list_levels sees world levels", status == "OK" and level in listing)
-        status, msg = s.call("set_intgrid", {
-            "level": level, "layer": layer,
-            "rects": [{"cx": 0, "cy": 0, "w": 2, "h": 2, "value": 1}],
-        })
+        status, msg = s.call(
+            "set_intgrid",
+            {
+                "level": level,
+                "layer": layer,
+                "rects": [{"cx": 0, "cy": 0, "w": 2, "h": 2, "value": 1}],
+            },
+        )
         check("set_intgrid in world level", status == "OK", msg)
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
@@ -298,7 +410,9 @@ def test_multi_world():
     for w in saved.get("worlds", []):
         for lvl in w.get("levels", []):
             if lvl["identifier"] == level:
-                li = next(x for x in lvl["layerInstances"] if x["__identifier"] == layer)
+                li = next(
+                    x for x in lvl["layerInstances"] if x["__identifier"] == layer
+                )
                 found = sum(1 for v in li["intGridCsv"] if v != 0) >= 4
     check("world level intGrid updated", found)
 
@@ -310,26 +424,44 @@ def test_level_lifecycle():
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
-        st, msg = s.call("create_level", {"identifier": "LC_Base", "px_wid": 256, "px_hei": 256})
+        st, msg = s.call(
+            "create_level", {"identifier": "LC_Base", "px_wid": 256, "px_hei": 256}
+        )
         check("create_level", st == "OK", msg)
-        st, msg = s.call("duplicate_level", {"level": "LC_Base", "identifier": "LC_Copy"})
+        st, msg = s.call(
+            "duplicate_level", {"level": "LC_Base", "identifier": "LC_Copy"}
+        )
         check("duplicate_level", st == "OK", msg)
-        st, msg = s.call("move_level", {"level": "LC_Copy", "world_x": 2048, "world_y": 512})
+        st, msg = s.call(
+            "move_level", {"level": "LC_Copy", "world_x": 2048, "world_y": 512}
+        )
         check("move_level", st == "OK", msg)
-        st, msg = s.call("resize_level", {"level": "LC_Copy", "px_wid": 128, "px_hei": 128})
+        st, msg = s.call(
+            "resize_level", {"level": "LC_Copy", "px_wid": 128, "px_hei": 128}
+        )
         check("resize_level", st == "OK", msg)
         st, lvl = s.call("get_level", {"level": "LC_Copy"})
         check("get_level after resize", st == "OK", lvl)
         if st == "OK":
             g = json.loads(lvl)
-            check("resized dimensions", g["pxWid"] == 128 and g["pxHei"] == 128, (g.get("pxWid"), g.get("pxHei")))
+            check(
+                "resized dimensions",
+                g["pxWid"] == 128 and g["pxHei"] == 128,
+                (g.get("pxWid"), g.get("pxHei")),
+            )
             ig = next((L for L in g["layers"] if L["type"] == "IntGrid"), None)
             if ig:
-                check("intgrid reflowed to new width", ig["cWid"] == 128 // ig["gridSize"], ig)
+                check(
+                    "intgrid reflowed to new width",
+                    ig["cWid"] == 128 // ig["gridSize"],
+                    ig,
+                )
         st, msg = s.call("delete_level", {"level": "LC_Copy"})
         check("delete_level", st == "OK", msg)
         st, listing = s.call("list_levels", {})
-        check("deleted level gone", st == "OK" and "LC_Copy" not in listing, listing[:200])
+        check(
+            "deleted level gone", st == "OK" and "LC_Copy" not in listing, listing[:200]
+        )
         check("base level remains", "LC_Base" in listing, listing[:200])
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
@@ -343,11 +475,18 @@ def test_world_tools():
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
-        st, msg = s.call("create_world", {
-            "identifier": "NewWorld", "world_layout": "GridVania", "world_grid_width": 128,
-        })
+        st, msg = s.call(
+            "create_world",
+            {
+                "identifier": "NewWorld",
+                "world_layout": "GridVania",
+                "world_grid_width": 128,
+            },
+        )
         check("create_world", st == "OK", msg)
-        st, msg = s.call("set_world_layout", {"world": "NewWorld", "world_layout": "Free"})
+        st, msg = s.call(
+            "set_world_layout", {"world": "NewWorld", "world_layout": "Free"}
+        )
         check("set_world_layout", st == "OK", msg)
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
@@ -374,7 +513,9 @@ def test_flood_fill():
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
-        st, msg = s.call("create_level", {"identifier": "FF_Test", "px_wid": 128, "px_hei": 128})
+        st, msg = s.call(
+            "create_level", {"identifier": "FF_Test", "px_wid": 128, "px_hei": 128}
+        )
         check("create_level", st == "OK", msg)
         # Seed a closed border so the interior fill is bounded.
         st, dims = s.call("get_intgrid", {"level": "FF_Test", "layer": intgrid})
@@ -387,21 +528,36 @@ def test_flood_fill():
             {"cx": 0, "cy": 0, "w": 1, "h": ch, "value": 1},
             {"cx": cw - 1, "cy": 0, "w": 1, "h": ch, "value": 1},
         ]
-        st, msg = s.call("set_intgrid", {"level": "FF_Test", "layer": intgrid, "rects": rects})
+        st, msg = s.call(
+            "set_intgrid", {"level": "FF_Test", "layer": intgrid, "rects": rects}
+        )
         check("seed border", st == "OK", msg)
         # Fill the interior from a center cell.
-        st, msg = s.call("flood_fill_intgrid", {
-            "level": "FF_Test", "layer": intgrid, "cx": cw // 2, "cy": ch // 2, "value": 2,
-        })
+        st, msg = s.call(
+            "flood_fill_intgrid",
+            {
+                "level": "FF_Test",
+                "layer": intgrid,
+                "cx": cw // 2,
+                "cy": ch // 2,
+                "value": 2,
+            },
+        )
         check("flood_fill_intgrid", st == "OK", msg)
         st, after = s.call("get_intgrid", {"level": "FF_Test", "layer": intgrid})
         if st == "OK":
             csv = json.loads(after)["csv"]
             interior = (cw - 2) * (ch - 2)
-            check("interior filled", sum(1 for v in csv if v == 2) == interior,
-                  (sum(1 for v in csv if v == 2), interior))
-            check("border preserved", sum(1 for v in csv if v == 1) == cw * ch - interior,
-                  sum(1 for v in csv if v == 1))
+            check(
+                "interior filled",
+                sum(1 for v in csv if v == 2) == interior,
+                (sum(1 for v in csv if v == 2), interior),
+            )
+            check(
+                "border preserved",
+                sum(1 for v in csv if v == 1) == cw * ch - interior,
+                sum(1 for v in csv if v == 1),
+            )
         check("save", s.call("save_project", {})[0] == "OK")
     finally:
         s.close()
@@ -418,67 +574,131 @@ def test_define_from_scratch():
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
 
-        st, msg = s.call("create_tileset_def", {
-            "identifier": "T3_Atlas", "rel_path": "atlas3.png",
-            "px_wid": 64, "px_hei": 64, "tile_grid_size": 16,
-        })
+        st, msg = s.call(
+            "create_tileset_def",
+            {
+                "identifier": "T3_Atlas",
+                "rel_path": "atlas3.png",
+                "px_wid": 64,
+                "px_hei": 64,
+                "tile_grid_size": 16,
+            },
+        )
         check("create_tileset_def", st == "OK", msg)
 
-        st, msg = s.call("create_enum", {"identifier": "T3_Loot", "values": ["Gold", "Gems"]})
+        st, msg = s.call(
+            "create_enum", {"identifier": "T3_Loot", "values": ["Gold", "Gems"]}
+        )
         check("create_enum", st == "OK", msg)
 
         # Look up the new tileset uid for the entity tile binding.
         st, defs = s.call("describe_defs", {})
         ts_uid = None
         if st == "OK":
-            ts = next((t for t in json.loads(defs)["tilesets"] if t["identifier"] == "T3_Atlas"), None)
+            ts = next(
+                (
+                    t
+                    for t in json.loads(defs)["tilesets"]
+                    if t["identifier"] == "T3_Atlas"
+                ),
+                None,
+            )
             ts_uid = ts["uid"] if ts else None
         check("new tileset visible in describe_defs", ts_uid is not None, defs[:200])
 
-        st, msg = s.call("create_entity_def", {
-            "identifier": "T3_Pickup", "width": 16, "height": 16,
-            "tileset_uid": ts_uid, "tile_id": 0,
-        })
+        st, msg = s.call(
+            "create_entity_def",
+            {
+                "identifier": "T3_Pickup",
+                "width": 16,
+                "height": 16,
+                "tileset_uid": ts_uid,
+                "tile_id": 0,
+            },
+        )
         check("create_entity_def (tile)", st == "OK", msg)
 
-        st, msg = s.call("create_layer_def", {
-            "identifier": "T3_Walls", "type": "IntGrid",
-            "int_grid_values": [{"value": 1, "identifier": "wall", "color": "#FF0000"}],
-        })
+        st, msg = s.call(
+            "create_layer_def",
+            {
+                "identifier": "T3_Walls",
+                "type": "IntGrid",
+                "int_grid_values": [
+                    {"value": 1, "identifier": "wall", "color": "#FF0000"}
+                ],
+            },
+        )
         check("create_layer_def (IntGrid)", st == "OK", msg)
 
         # New levels must include the backfilled layer; so must existing ones.
-        st, msg = s.call("create_level", {"identifier": "T3_Level", "px_wid": 64, "px_hei": 64})
+        st, msg = s.call(
+            "create_level", {"identifier": "T3_Level", "px_wid": 64, "px_hei": 64}
+        )
         check("create_level", st == "OK", msg)
         st, lvl = s.call("get_level", {"level": "T3_Level"})
         if st == "OK":
             layers = json.loads(lvl)["layers"]
             walls = next((L for L in layers if L["identifier"] == "T3_Walls"), None)
-            check("new layer backfilled into new level", walls is not None and walls["type"] == "IntGrid", layers)
+            check(
+                "new layer backfilled into new level",
+                walls is not None and walls["type"] == "IntGrid",
+                layers,
+            )
 
         # Add a field to the new entity and prove the encode path works end to end.
-        st, msg = s.call("add_entity_field", {
-            "entity": "T3_Pickup", "identifier": "loot", "field_type": "Enum", "enum_id": "T3_Loot",
-        })
+        st, msg = s.call(
+            "add_entity_field",
+            {
+                "entity": "T3_Pickup",
+                "identifier": "loot",
+                "field_type": "Enum",
+                "enum_id": "T3_Loot",
+            },
+        )
         check("add_entity_field (enum)", st == "OK", msg)
 
-        st, msg = s.call("place_entities", {
-            "level": "T3_Level", "layer": ent_layer,
-            "entities": [{"identifier": "T3_Pickup", "cx": 1, "cy": 1, "fields": {"loot": "Gold"}}],
-        })
+        st, msg = s.call(
+            "place_entities",
+            {
+                "level": "T3_Level",
+                "layer": ent_layer,
+                "entities": [
+                    {
+                        "identifier": "T3_Pickup",
+                        "cx": 1,
+                        "cy": 1,
+                        "fields": {"loot": "Gold"},
+                    }
+                ],
+            },
+        )
         check("place_entities w/ new entity+field", st == "OK", msg)
         st, listing = s.call("get_entities", {"level": "T3_Level", "layer": ent_layer})
         if st == "OK":
             ents = [e for grp in json.loads(listing) for e in grp["entities"]]
             pickup = next((e for e in ents if e["identifier"] == "T3_Pickup"), None)
-            check("placed entity decodes enum field",
-                  pickup is not None and pickup["fields"].get("loot") == "Gold", listing[:300])
+            check(
+                "placed entity decodes enum field",
+                pickup is not None and pickup["fields"].get("loot") == "Gold",
+                listing[:300],
+            )
 
         # Invalid enum value should be rejected by the encode path.
-        st, msg = s.call("place_entities", {
-            "level": "T3_Level", "layer": ent_layer,
-            "entities": [{"identifier": "T3_Pickup", "cx": 2, "cy": 2, "fields": {"loot": "Diamond"}}],
-        })
+        st, msg = s.call(
+            "place_entities",
+            {
+                "level": "T3_Level",
+                "layer": ent_layer,
+                "entities": [
+                    {
+                        "identifier": "T3_Pickup",
+                        "cx": 2,
+                        "cy": 2,
+                        "fields": {"loot": "Diamond"},
+                    }
+                ],
+            },
+        )
         check("invalid enum value rejected", st == "ERROR", msg)
 
         # Everything we authored should still validate cleanly against the schema.
@@ -492,34 +712,58 @@ def test_define_from_scratch():
 
 
 def test_safety():
-    print("Safety: preview_changes / undo / redo / revert_unsaved (Typical_TopDown_example.ldtk)")
+    print(
+        "Safety: preview_changes / undo / redo / revert_unsaved (Typical_TopDown_example.ldtk)"
+    )
     wd = workdir()
     f = copy_into(wd, "Typical_TopDown_example.ldtk")
     s = Session()
     try:
         assert s.call("open_project", {"path": f})[0] == "OK"
         st, text = s.call("preview_changes", {})
-        check("preview clean before edits", st == "OK" and "matches the file on disk" in text, text[:200])
+        check(
+            "preview clean before edits",
+            st == "OK" and "matches the file on disk" in text,
+            text[:200],
+        )
 
-        st, msg = s.call("create_level", {"identifier": "Safety_Test", "px_wid": 128, "px_hei": 128})
+        st, msg = s.call(
+            "create_level", {"identifier": "Safety_Test", "px_wid": 128, "px_hei": 128}
+        )
         check("create_level", st == "OK", msg)
         st, text = s.call("preview_changes", {})
-        check("preview lists added level", st == "OK" and "Safety_Test" in text and "added" in text, text[:300])
+        check(
+            "preview lists added level",
+            st == "OK" and "Safety_Test" in text and "added" in text,
+            text[:300],
+        )
 
         st, msg = s.call("undo", {})
         check("undo runs", st == "OK", msg)
         st, text = s.call("preview_changes", {})
-        check("preview clean after undo", st == "OK" and "matches the file on disk" in text, text[:200])
+        check(
+            "preview clean after undo",
+            st == "OK" and "matches the file on disk" in text,
+            text[:200],
+        )
 
         st, msg = s.call("redo", {})
         check("redo runs", st == "OK", msg)
         st, text = s.call("preview_changes", {})
-        check("preview lists level again after redo", st == "OK" and "Safety_Test" in text, text[:300])
+        check(
+            "preview lists level again after redo",
+            st == "OK" and "Safety_Test" in text,
+            text[:300],
+        )
 
         st, msg = s.call("revert_unsaved", {})
         check("revert_unsaved runs", st == "OK", msg)
         st, listing = s.call("list_levels", {})
-        check("reverted level gone", st == "OK" and "Safety_Test" not in listing, listing[:200])
+        check(
+            "reverted level gone",
+            st == "OK" and "Safety_Test" not in listing,
+            listing[:200],
+        )
         # Revert clears history, so there is nothing left to undo.
         st, msg = s.call("undo", {})
         check("undo empty after revert", st == "ERROR", msg)
@@ -530,7 +774,10 @@ def test_safety():
         s.close()
 
     saved = json.load(open(f))
-    check("file has no Safety_Test level", all(l["identifier"] != "Safety_Test" for l in saved["levels"]))
+    check(
+        "file has no Safety_Test level",
+        all(l["identifier"] != "Safety_Test" for l in saved["levels"]),
+    )
 
 
 def test_validate():
