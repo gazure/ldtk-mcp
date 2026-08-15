@@ -47,6 +47,7 @@ Requires a recent stable Rust toolchain.
 | `paint_tiles` | Paint tiles on a Tile layer by grid coordinate and tile id (pixel `src` computed from tileset geometry). |
 | `clear_tiles` | Remove tiles from a Tile layer, entirely or within a grid rectangle. |
 | `create_layer_def` | Define a new layer (IntGrid/Entities/Tiles/AutoLayer) and backfill an empty instance into every level. |
+| `add_intgrid_values` | Add or update IntGrid value definitions on an existing IntGrid layer def (upsert by value; extends the palette). |
 | `create_entity_def` | Define a new entity (size, color, tags); optional tileset tile binding for `Tile` rendering. |
 | `create_enum` | Define a new enum from a list of value identifiers. |
 | `create_tileset_def` | Define a new tileset from an image path + explicit dimensions (grid/padding/spacing). |

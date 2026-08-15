@@ -366,6 +366,14 @@ pub struct IntGridValueSpec {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct AddIntGridValuesArgs {
+    /// IntGrid layer definition to extend, by identifier or uid.
+    pub layer: String,
+    /// Value definitions to add or update (upserted by `value`).
+    pub values: Vec<IntGridValueSpec>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct CreateLayerDefArgs {
     /// Unique identifier for the new layer definition.
     pub identifier: String,
@@ -1031,6 +1039,26 @@ impl LdtkServer {
                 args.layer_type,
                 args.identifier,
                 def.get("uid").and_then(Value::as_i64).unwrap_or(0),
+            ))
+        })
+    }
+
+    #[tool(
+        description = "Add or update IntGrid value definitions on an existing IntGrid layer def (addressed by identifier or uid). Upserts by `value`; extends a layer's palette without recreating it. Level instances are unaffected."
+    )]
+    fn add_intgrid_values(&self, Parameters(args): Parameters<AddIntGridValuesArgs>) -> Result<String, ErrorData> {
+        self.with_project_mut(|p| {
+            let specs: Vec<Value> = args
+                .values
+                .iter()
+                .map(|s| json!({ "value": s.value, "identifier": s.identifier, "color": s.color }))
+                .collect();
+            let (added, updated) = p
+                .add_intgrid_values(&args.layer, specs)
+                .map_err(|e| err(format!("{e:#}")))?;
+            Ok(format!(
+                "IntGrid layer '{}': {added} value(s) added, {updated} updated. Call save_project to persist.",
+                args.layer
             ))
         })
     }

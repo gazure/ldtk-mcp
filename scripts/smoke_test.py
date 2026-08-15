@@ -643,6 +643,28 @@ def test_define_from_scratch():
         )
         check("create_layer_def (IntGrid)", st == "OK", msg)
 
+        # Extend the IntGrid palette on the existing layer def (append + upsert).
+        st, msg = s.call(
+            "add_intgrid_values",
+            {
+                "layer": "T3_Walls",
+                "values": [
+                    {"value": 2, "identifier": "Tree", "color": "#2E7D32"},
+                    {"value": 3, "identifier": "Fence", "color": "#8D6E63"},
+                    {"value": 1, "identifier": "wall", "color": "#FF3333"},
+                ],
+            },
+        )
+        check("add_intgrid_values", st == "OK", msg)
+        st, defs = s.call("describe_defs", {})
+        if st == "OK":
+            walls_def = next((L for L in json.loads(defs)["layers"] if L["identifier"] == "T3_Walls"), None)
+            vals = walls_def.get("intGridValues") if walls_def else None
+            ids = {v["value"]: v.get("identifier") for v in (vals or [])}
+            check("intgrid palette extended", ids.get(2) == "Tree" and ids.get(3) == "Fence", ids)
+            colors = {v["value"]: v.get("color") for v in (vals or [])}
+            check("intgrid value upserted in place", len(vals or []) == 3 and colors.get(1) == "#FF3333", vals)
+
         # New levels must include the backfilled layer; so must existing ones.
         st, msg = s.call(
             "create_level", {"identifier": "T3_Level", "px_wid": 64, "px_hei": 64}

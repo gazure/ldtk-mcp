@@ -949,6 +949,94 @@ impl Project {
         Ok(def)
     }
 
+    /// Append or update IntGrid value definitions on an existing IntGrid layer def, addressed by
+    /// identifier or uid. Each spec is `{ value, identifier?, color? }`; entries are upserted by
+    /// `value` (1-based) and the array is kept sorted by value. Returns `(added, updated)` counts.
+    ///
+    /// Value defs are pure definitions, so no level instances need backfilling.
+    pub fn add_intgrid_values(&mut self, layer: &str, specs: Vec<Value>) -> Result<(usize, usize)> {
+        let layers = self
+            .root
+            .get_mut("defs")
+            .and_then(|d| d.get_mut("layers"))
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| anyhow!("project has no layer definitions"))?;
+        let def = layers
+            .iter_mut()
+            .find(|l| {
+                l.get("identifier").and_then(Value::as_str) == Some(layer)
+                    || l.get("uid").and_then(Value::as_i64).map(|u| u.to_string()).as_deref() == Some(layer)
+            })
+            .ok_or_else(|| anyhow!("layer definition '{layer}' not found"))?;
+        let kind = def
+            .get("__type")
+            .or_else(|| def.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if kind != "IntGrid" {
+            bail!("layer '{layer}' is not an IntGrid layer (it is '{kind}')");
+        }
+        let arr = def
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("layer def is not an object"))?
+            .entry("intGridValues")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("`intGridValues` is not an array"))?;
+
+        let (mut added, mut updated) = (0usize, 0usize);
+        for spec in specs {
+            let value = spec
+                .get("value")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("each IntGrid value needs a numeric `value`"))?;
+            if value < 1 {
+                bail!("IntGrid value must be >= 1 (0 means empty); got {value}");
+            }
+            let identifier = spec.get("identifier").and_then(Value::as_str).map(String::from);
+            let color = spec
+                .get("color")
+                .and_then(Value::as_str)
+                .unwrap_or("#FFFFFF")
+                .to_string();
+
+            // LDtk requires identifiers unique within a layer; reject collisions with a *different* value.
+            if let Some(id) = &identifier {
+                let clash = arr.iter().any(|e| {
+                    e.get("identifier").and_then(Value::as_str) == Some(id.as_str())
+                        && e.get("value").and_then(Value::as_i64) != Some(value)
+                });
+                if clash {
+                    bail!("IntGrid identifier '{id}' is already used by another value on '{layer}'");
+                }
+            }
+
+            match arr
+                .iter_mut()
+                .find(|e| e.get("value").and_then(Value::as_i64) == Some(value))
+            {
+                Some(existing) => {
+                    existing["identifier"] = identifier.map(Value::from).unwrap_or(Value::Null);
+                    existing["color"] = json!(color);
+                    updated += 1;
+                }
+                None => {
+                    arr.push(json!({
+                        "value": value,
+                        "identifier": identifier,
+                        "color": color,
+                        "groupUid": 0,
+                        "tile": Value::Null,
+                    }));
+                    added += 1;
+                }
+            }
+        }
+        arr.sort_by_key(|e| e.get("value").and_then(Value::as_i64).unwrap_or(0));
+        self.dirty = true;
+        Ok((added, updated))
+    }
+
     /// Decide where a newly created level should live: root, or the first world in
     /// multi-world projects (root `levels` empty but `worlds` present).
     fn create_target_world(&self) -> Option<usize> {
@@ -2307,6 +2395,63 @@ mod tests {
         // Duplicate identifier and invalid type are rejected.
         assert!(p.create_layer_def("Walls", "Tiles", None, None, None).is_err());
         assert!(p.create_layer_def("Bogus", "Nope", None, None, None).is_err());
+    }
+
+    #[test]
+    fn add_intgrid_values_appends_upserts_and_validates() {
+        let mut p = project(json!({
+            "nextUid": 50,
+            "defs": { "layers": [
+                { "uid": 1, "identifier": "Collisions", "__type": "IntGrid",
+                  "intGridValues": [{ "value": 1, "identifier": "wall", "color": "#000000", "groupUid": 0, "tile": null }] },
+                { "uid": 2, "identifier": "Entities", "__type": "Entities" },
+            ] },
+            "levels": [],
+        }));
+
+        // Append two new values, addressing the layer by uid.
+        let (added, updated) = p
+            .add_intgrid_values(
+                "1",
+                vec![
+                    json!({ "value": 3, "identifier": "Tree", "color": "#2E7D32" }),
+                    json!({ "value": 2, "identifier": "Fence", "color": "#8D6E63" }),
+                ],
+            )
+            .unwrap();
+        assert_eq!((added, updated), (2, 0));
+        assert!(p.dirty);
+
+        // Kept sorted by value: 1, 2, 3.
+        let vals = p.intgrid_value_defs("Collisions");
+        let order: Vec<i64> = vals
+            .iter()
+            .filter_map(|v| v.get("value").and_then(Value::as_i64))
+            .collect();
+        assert_eq!(order, vec![1, 2, 3]);
+        assert_eq!(vals[1].get("identifier").and_then(Value::as_str), Some("Fence"));
+
+        // Upsert: same value updates identifier/color in place.
+        let (added, updated) = p
+            .add_intgrid_values(
+                "Collisions",
+                vec![json!({ "value": 1, "identifier": "Wall2", "color": "#111111" })],
+            )
+            .unwrap();
+        assert_eq!((added, updated), (0, 1));
+        let vals = p.intgrid_value_defs("Collisions");
+        assert_eq!(vals[0].get("identifier").and_then(Value::as_str), Some("Wall2"));
+        assert_eq!(vals.len(), 3);
+
+        // Rejections: non-IntGrid layer, value < 1, identifier clash with a different value.
+        assert!(p.add_intgrid_values("Entities", vec![json!({ "value": 1 })]).is_err());
+        assert!(p
+            .add_intgrid_values("Collisions", vec![json!({ "value": 0, "identifier": "x" })])
+            .is_err());
+        assert!(p
+            .add_intgrid_values("Collisions", vec![json!({ "value": 9, "identifier": "Tree" })])
+            .is_err());
+        assert!(p.add_intgrid_values("Missing", vec![json!({ "value": 1 })]).is_err());
     }
 
     #[test]
