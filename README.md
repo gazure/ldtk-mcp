@@ -29,6 +29,7 @@ Requires a recent stable Rust toolchain.
 | `get_entities` | List entity instances on a level (one layer or all) with iid, grid position, tags, and decoded field values. |
 | `get_intgrid` | Read an IntGrid layer: dimensions, the row-major `csv`, and value definitions (number to identifier/color). |
 | `get_entity` | Fetch a single entity instance by iid, with a decoded `fields` map and the raw `fieldInstances`. |
+| `render_level` | Rasterize a level to a PNG (IntGrid colors, real tileset tiles, entities) and return it inline as an image. |
 | `create_level` | Append a new empty level; layer instances are built from the project's layer defs. |
 | `duplicate_level` | Deep-copy a level (fresh uid/iids) to the next free world position. |
 | `move_level` | Set a level's world-space pixel position (`worldX`/`worldY`). |
@@ -80,10 +81,33 @@ Every mutating tool automatically snapshots the project first, so edits are reve
   `save_project` again.
 - `revert_unsaved` discards all unsaved edits by reloading from disk (and clears the history).
 
+### Visual feedback
+
+`render_level` rasterizes a level to a PNG and returns it inline as image content, so an agent can
+*see* the result of its edits (perceive→act→verify). It draws IntGrid cells in their value colors,
+real tiles sampled from the decoded tileset images, and entities as their tile sprite or a colored
+box. Output is capped to ~1024px on the longest edge by default (override with `scale` / `max_px`),
+and only the requested `layers` are drawn when that argument is given.
+
+Tilesets whose image can't be decoded (`.aseprite`, embedded atlases) render as a magenta
+placeholder and are reported in the tool's text note — a render never fails outright.
+
+> **AutoLayer caveat:** the editing tools clear `autoLayerTiles` so LDtk regenerates them on load.
+> A freshly-edited IntGrid therefore previews as its **value colors**, not the generated tiles,
+> until the project is reopened in LDtk.
+
+### Resources
+
+The server exposes tileset images as MCP resources so a client (or the agent) can reference the art
+when choosing tile ids:
+
+- `ldtk://tileset/{uid}` — the tileset's image file as a base64 `image/png` (or gif/jpeg) blob.
+- `ldtk://level/{level}/preview.png` — a rendered preview of a level (resource template).
+
 ### Recommended workflow
 
 `open_project` → `describe_defs` → `create_level` → `set_intgrid` / `place_entities` →
-`preview_changes` → `validate_project` → `save_project`.
+`render_level` → `preview_changes` → `validate_project` → `save_project`.
 
 For tile visuals, prefer editing the **IntGrid** that drives an **AutoLayer** rather than painting
 tiles directly — LDtk renders the tiles from the rules automatically on load.

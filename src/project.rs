@@ -92,6 +92,11 @@ impl Project {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// Resolve a project-relative path (e.g. a tileset `relPath`) against the project directory.
+    pub fn resolve_rel_path(&self, rel: &str) -> PathBuf {
+        self.project_dir().join(rel)
+    }
+
     /// For external-level projects, pull each `.ldtkl` body into its in-tree level entry so
     /// all editing happens uniformly in memory. `save` reverses this.
     fn merge_external_levels(&mut self) -> Result<()> {

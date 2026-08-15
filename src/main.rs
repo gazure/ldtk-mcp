@@ -3,6 +3,7 @@
 mod diff;
 mod fields;
 mod project;
+mod render;
 mod schema;
 mod tools;
 
