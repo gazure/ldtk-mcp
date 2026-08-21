@@ -733,7 +733,7 @@ impl Project {
     }
 
     /// Create a new enum definition from a list of value identifiers.
-    pub fn create_enum(&mut self, identifier: &str, values: Vec<String>) -> Result<Value> {
+    pub fn create_enum(&mut self, identifier: &str, values: &[String]) -> Result<Value> {
         if self.def_identifier_exists("enums", identifier) {
             bail!("an enum '{identifier}' already exists");
         }
@@ -1306,12 +1306,12 @@ impl Project {
             .and_then(Value::as_i64)
             .unwrap_or(256);
         let (world_x, world_y) = self.next_world_position(px_wid, &layout);
-        let new_uid = self.alloc_uid()?;
+        let uid = self.alloc_uid()?;
 
         let mut lvl = self.level_ref(r).unwrap().clone();
         lvl["identifier"] = json!(new_id);
         lvl["iid"] = json!(Self::new_iid());
-        lvl["uid"] = json!(new_uid);
+        lvl["uid"] = json!(uid);
         lvl["worldX"] = json!(world_x);
         lvl["worldY"] = json!(world_y);
         lvl["__neighbours"] = json!([]);
@@ -1319,7 +1319,7 @@ impl Project {
         if let Some(insts) = lvl.get_mut("layerInstances").and_then(Value::as_array_mut) {
             for li in insts {
                 li["iid"] = json!(Self::new_iid());
-                li["levelId"] = json!(new_uid);
+                li["levelId"] = json!(uid);
             }
         }
         self.push_level(r, lvl.clone())?;
@@ -1673,10 +1673,10 @@ fn null_external_layer_instances(root: &mut Value) {
 /// falls outside the new bounds.
 fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
     let grid = li.get("__gridSize").and_then(Value::as_i64).unwrap_or(16).max(1);
-    let old_cw = li.get("__cWid").and_then(Value::as_i64).unwrap_or(0);
-    let old_ch = li.get("__cHei").and_then(Value::as_i64).unwrap_or(0);
-    let new_cw = ((px_wid as f64 / grid as f64).ceil() as i64).max(0);
-    let new_ch = ((px_hei as f64 / grid as f64).ceil() as i64).max(0);
+    let old_cols = li.get("__cWid").and_then(Value::as_i64).unwrap_or(0);
+    let old_rows = li.get("__cHei").and_then(Value::as_i64).unwrap_or(0);
+    let new_cols = ((px_wid as f64 / grid as f64).ceil() as i64).max(0);
+    let new_rows = ((px_hei as f64 / grid as f64).ceil() as i64).max(0);
     let kind = li.get("__type").and_then(Value::as_str).unwrap_or("").to_string();
 
     // IntGrid: rebuild the CSV, preserving the overlapping top-left region; clear the
@@ -1687,13 +1687,13 @@ fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
             .and_then(Value::as_array)
             .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(0)).collect())
             .unwrap_or_default();
-        let mut grid_csv = vec![0i64; (new_cw * new_ch).max(0) as usize];
-        let copy_w = old_cw.min(new_cw);
-        let copy_h = old_ch.min(new_ch);
+        let mut grid_csv = vec![0i64; (new_cols * new_rows).max(0) as usize];
+        let copy_w = old_cols.min(new_cols);
+        let copy_h = old_rows.min(new_rows);
         for y in 0..copy_h {
             for x in 0..copy_w {
-                let oi = (y * old_cw + x) as usize;
-                let ni = (y * new_cw + x) as usize;
+                let oi = (y * old_cols + x) as usize;
+                let ni = (y * new_cols + x) as usize;
                 if oi < old.len() && ni < grid_csv.len() {
                     grid_csv[ni] = old[oi];
                 }
@@ -1720,7 +1720,7 @@ fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
                         p.get(1).and_then(Value::as_i64).unwrap_or(0),
                     )
                 });
-                t["d"] = json!([(y / grid) * new_cw + (x / grid)]);
+                t["d"] = json!([(y / grid) * new_cols + (x / grid)]);
             }
         }
     }
@@ -1731,13 +1731,13 @@ fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
             e.get("__grid").and_then(Value::as_array).is_none_or(|g| {
                 let cx = g.first().and_then(Value::as_i64).unwrap_or(0);
                 let cy = g.get(1).and_then(Value::as_i64).unwrap_or(0);
-                cx >= 0 && cy >= 0 && cx < new_cw && cy < new_ch
+                cx >= 0 && cy >= 0 && cx < new_cols && cy < new_rows
             })
         });
     }
 
-    li["__cWid"] = json!(new_cw);
-    li["__cHei"] = json!(new_ch);
+    li["__cWid"] = json!(new_cols);
+    li["__cHei"] = json!(new_rows);
 }
 
 /// Cheap non-crypto seed for auto-layer rendering (`LDtk` just needs *a* number).
@@ -1808,7 +1808,7 @@ mod tests {
         let chest = &defs[0];
         assert_eq!(chest.identifier, "Chest");
         assert_eq!(chest.width, 24);
-        assert_eq!(chest.pivot_y, 1.0);
+        assert!((chest.pivot_y - 1.0).abs() < f64::EPSILON);
         assert_eq!(chest.tags, vec!["loot".to_string()]);
     }
 
@@ -2460,15 +2460,13 @@ mod tests {
     #[test]
     fn create_enum_builds_values() {
         let mut p = project(sample_defs());
-        let def = p
-            .create_enum("Direction", vec!["North".into(), "South".into()])
-            .unwrap();
+        let def = p.create_enum("Direction", &["North".into(), "South".into()]).unwrap();
         let vals = def.get("values").and_then(Value::as_array).unwrap();
         assert_eq!(vals.len(), 2);
         assert_eq!(vals[0].get("id").and_then(Value::as_str), Some("North"));
         assert_eq!(vals[0].get("color").and_then(Value::as_i64), Some(0));
         assert!(def.get("tags").and_then(Value::as_array).unwrap().is_empty());
-        assert!(p.create_enum("Direction", vec![]).is_err());
+        assert!(p.create_enum("Direction", &[]).is_err());
     }
 
     #[test]
@@ -2516,7 +2514,7 @@ mod tests {
     #[test]
     fn add_level_field_enum_resolves_uid() {
         let mut p = project(sample_defs());
-        let en = p.create_enum("Biome", vec!["Forest".into(), "Desert".into()]).unwrap();
+        let en = p.create_enum("Biome", &["Forest".into(), "Desert".into()]).unwrap();
         let uid = en.get("uid").and_then(Value::as_i64).unwrap();
         let def = p
             .add_level_field("biome", "Enum", false, true, None, None, Some("Biome"))

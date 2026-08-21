@@ -7,8 +7,9 @@
 //! (`.aseprite`, embedded) render as a magenta placeholder so a render never fails outright.
 
 // The blit/draw helpers are inherently many-parameter (rect geometry + flip + opacity); a context
-// struct would obscure more than it clarifies for this internal module.
-#![allow(clippy::too_many_arguments)]
+// struct would obscure more than it clarifies for this internal module. Their x/y/w/h/c names are
+// the conventional ones for raster geometry, so spelling them out would read as noise.
+#![allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 
 use std::{collections::HashMap, path::Path};
 
@@ -179,7 +180,7 @@ fn decode_png(path: &Path) -> Result<DecodedImage> {
         png::ColorType::Rgb => widen(&buf, 3, false),
         png::ColorType::GrayscaleAlpha => widen(&buf, 2, true),
         png::ColorType::Grayscale => widen(&buf, 1, true),
-        other => return Err(anyhow!("unsupported PNG color type {other:?}")),
+        png::ColorType::Indexed => return Err(anyhow!("unsupported PNG color type: Indexed")),
     };
     Ok(DecodedImage { w, h, rgba })
 }
@@ -587,7 +588,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((out.width, out.height), (256, 128));
-        assert_eq!(out.scale, 4.0);
+        assert!((out.scale - 4.0).abs() < f64::EPSILON);
         let (w, h, buf) = decode(&out.png);
         assert_eq!((w, h), (256, 128));
         assert_eq!(px(&buf, w, 10, 10), [0x11, 0x22, 0x33, 255]);

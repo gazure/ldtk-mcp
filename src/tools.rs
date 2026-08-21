@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -1091,7 +1092,7 @@ impl LdtkServer {
     fn create_enum(&self, Parameters(args): Parameters<CreateEnumArgs>) -> Result<String, ErrorData> {
         self.with_project_mut(|p| {
             let def = p
-                .create_enum(&args.identifier, args.values.clone())
+                .create_enum(&args.identifier, &args.values)
                 .map_err(|e| err(format!("{e:#}")))?;
             Ok(format!(
                 "Created enum '{}' (uid={}) with {} value(s). Call save_project to persist.",
@@ -1665,15 +1666,11 @@ impl LdtkServer {
 /// MIME type for a tileset image by extension. `None` for formats we don't serve as images
 /// (e.g. `.aseprite`), so they're excluded from the resource list.
 fn image_mime(rel: &str) -> Option<&'static str> {
-    let lower = rel.to_ascii_lowercase();
-    if lower.ends_with(".png") {
-        Some("image/png")
-    } else if lower.ends_with(".gif") {
-        Some("image/gif")
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        Some("image/jpeg")
-    } else {
-        None
+    match Path::new(rel).extension()?.to_ascii_lowercase().to_str()? {
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        _ => None,
     }
 }
 
@@ -1709,7 +1706,7 @@ impl LdtkServer {
         Ok(ListResourcesResult::with_all_items(resources))
     }
 
-    fn resource_templates(&self) -> ListResourceTemplatesResult {
+    fn resource_templates() -> ListResourceTemplatesResult {
         let templates = vec![
             Annotated::new(RawResourceTemplate::new("ldtk://tileset/{uid}", "Tileset image"), None),
             Annotated::new(
@@ -1753,6 +1750,11 @@ impl LdtkServer {
     }
 }
 
+// ServerHandler declares these methods as async, and the tool_handler macro generates one more.
+// None of them have anything to await: the project sits behind a std Mutex, so every body is
+// synchronous. Satisfying the lint means hand-writing `-> impl Future` and `std::future::ready`
+// on each one, which reads worse than the `async fn` the trait asks for.
+#[allow(clippy::unused_async_trait_impl)]
 #[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for LdtkServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
@@ -1786,7 +1788,7 @@ impl ServerHandler for LdtkServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(self.resource_templates())
+        Ok(Self::resource_templates())
     }
 
     async fn read_resource(
