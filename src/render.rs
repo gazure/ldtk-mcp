@@ -71,7 +71,7 @@ struct Canvas {
 impl Canvas {
     fn new(w: u32, h: u32, bg: [u8; 4]) -> Self {
         let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
-        for chunk in px.chunks_exact_mut(4) {
+        for chunk in px.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&bg);
         }
         Self { w, h, px }

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Graphite pushes a synthetic base branch for every stacked PR; building it
+    # duplicates the run that the PR itself already triggers.
+    branches-ignore:
+      - "graphite-base/**"
+  # GitHub evicts caches that go unread for 7 days, so a quiet week would leave
+  # the next PR with a cold build. Touch the cache every Monday.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Three pushes to a branch in a row should not leave three builds fighting over
+# the runner pool. main is exempt: those runs publish the cache everything else
+# restores from, so they must be allowed to finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here is ever rebuilt on top of itself, so incremental artifacts are
+  # pure cache weight.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # rustfmt.toml sets imports_granularity and group_imports, which are still
+      # nightly-only, so stable rustfmt would silently ignore them.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # save-if restricts cache writes to main. GitHub scopes a PR's cache to
+      # that PR, so saving on every branch produces copies no other PR can read
+      # while still counting against the repo's 10GB quota.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all-features
+
+      # smoke_test.py shells out to target/debug/ldtk-mcp, so the binary has to
+      # exist before the script runs.
+      - name: Build debug binary
+        run: cargo build
+
+      - name: End-to-end smoke test
+        run: python3 scripts/smoke_test.py
