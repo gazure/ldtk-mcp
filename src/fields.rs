@@ -238,6 +238,48 @@ impl Project {
         }))
     }
 
+    /// Encode an `Enum` field, checking the value against the enum's declared identifiers.
+    ///
+    /// The value is checked only when the reference resolves to a declared enum, in either `enums`
+    /// or `externalEnums`. A reference that resolves to neither passes through unchecked.
+    fn encode_enum(&self, id: &str, name: &str, value: &Value) -> Result<(Value, Value), String> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| format!("field '{id}' expects an enum value string"))?;
+        if let Some(values) = self.enum_values(name) {
+            if !values.contains(&s.to_string()) {
+                return Err(format!(
+                    "field '{id}': '{s}' is not a value of enum '{name}' (valid: {values:?})"
+                ));
+            }
+        }
+        Ok((json!(s), wrap("V_String", &json!(escape_string(s)))))
+    }
+
+    /// Encode an `EntityRef` field by resolving the target iid to its layer, level, and world.
+    ///
+    /// Accepts either a bare iid string or an object carrying `entityIid`. The target must already
+    /// exist in the project; a dangling reference is an error rather than a null.
+    fn encode_entity_ref(&self, id: &str, value: &Value) -> Result<(Value, Value), String> {
+        let iid = value
+            .as_str()
+            .map(String::from)
+            .or_else(|| value.get("entityIid").and_then(Value::as_str).map(String::from))
+            .ok_or_else(|| format!("field '{id}' expects an entity iid string"))?;
+        let info = self
+            .resolve_entity_ref(&iid)
+            .ok_or_else(|| format!("field '{id}': entity ref '{iid}' not found in project"))?;
+        Ok((
+            json!({
+                "entityIid": iid,
+                "layerIid": info.layer,
+                "levelIid": info.level,
+                "worldIid": info.world,
+            }),
+            wrap("V_String", &json!(iid)),
+        ))
+    }
+
     /// Encode a single scalar -> (`__value` entry, `realEditorValues` entry).
     // Each match arm binds the scalar it just parsed, and the tile-rect and point arms destructure
     // into the component names LDtk itself uses (x/y/w/h, cx/cy). Longer names would not say more.
@@ -298,44 +340,14 @@ impl Project {
                 };
                 (json!(int_to_hex(n)), wrap("V_Int", &json!(n)))
             }
-            FieldKind::Enum(name) => {
-                let s = value
-                    .as_str()
-                    .ok_or_else(|| format!("field '{id}' expects an enum value string"))?;
-                if let Some(values) = self.enum_values(name) {
-                    if !values.contains(&s.to_string()) {
-                        return Err(format!(
-                            "field '{id}': '{s}' is not a value of enum '{name}' (valid: {values:?})"
-                        ));
-                    }
-                }
-                (json!(s), wrap("V_String", &json!(escape_string(s))))
-            }
+            FieldKind::Enum(name) => self.encode_enum(id, name, value)?,
             FieldKind::Point => {
                 let (cx, cy) =
                     parse_point(value).ok_or_else(|| format!("field '{id}' expects a point {{cx,cy}} or [x,y]"))?;
                 let s = format!("{cx},{cy}");
                 (json!({ "cx": cx, "cy": cy }), wrap("V_String", &json!(s)))
             }
-            FieldKind::EntityRef => {
-                let iid = value
-                    .as_str()
-                    .map(String::from)
-                    .or_else(|| value.get("entityIid").and_then(Value::as_str).map(String::from))
-                    .ok_or_else(|| format!("field '{id}' expects an entity iid string"))?;
-                let info = self
-                    .resolve_entity_ref(&iid)
-                    .ok_or_else(|| format!("field '{id}': entity ref '{iid}' not found in project"))?;
-                (
-                    json!({
-                        "entityIid": iid,
-                        "layerIid": info.layer,
-                        "levelIid": info.level,
-                        "worldIid": info.world,
-                    }),
-                    wrap("V_String", &json!(iid)),
-                )
-            }
+            FieldKind::EntityRef => self.encode_entity_ref(id, value)?,
             FieldKind::Tile => {
                 let (x, y, w, h) =
                     parse_tile_rect(value).ok_or_else(|| format!("field '{id}' expects a tile rect {{x,y,w,h}}"))?;

@@ -27,3 +27,15 @@ base64 = "0.22"
 [lints.clippy]
 # priority -1 so individual lint keys below can override the group.
 pedantic = { level = "warn", priority = -1 }
+
+# The LDtk model is i64 everywhere, because that is what serde_json parses integers into. The
+# rasterizer indexes u32/usize buffers and writes u8 channels, and grid geometry rounds through
+# f64, so crossing between those worlds is constant and deliberate. Each site is already guarded
+# where it matters: blend() returns early when a coordinate falls outside the canvas, the flood
+# fill range-checks against cw/ch before indexing, and the scale math clamps with max(1). Writing
+# try_from at each of the ~65 sites would either add a panic path or substitute a wrong index on
+# failure, so the group stays on and these four come off.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
