@@ -146,6 +146,32 @@ when choosing tile ids:
   are rewritten on `save_project`. Each `.ldtkl` file gets the full level body, and the main file
   keeps the stub with `layerInstances: null`.
 
+## AutoLayer rules
+
+The server reads and renders AutoLayers, but it doesn't author their rules yet. If you need to
+inspect or hand-edit them, this is the shape LDtk writes, confirmed against
+`samples/AutoLayers_1_basic.ldtk`.
+
+Rules live on the layer *definition*, not on the layer instance:
+
+```
+layerDef.autoRuleGroups: [{ uid, name, color, icon, active, isOptional, rules: [...],
+                            usesWizard, requiredBiomeValues, biomeRequirementMode }]
+rule: { uid, active, size, tileRectsIds: [[tileId,...]], alpha, chance, breakOnMatch,
+        pattern: [i64; size*size], flipX, flipY, xModulo, yModulo, xOffset, yOffset,
+        tileXOffset, tileYOffset, tileRandom{X,Y}{Min,Max}, checker, tileMode ("Single"|"Stamp"),
+        pivotX, pivotY, outOfBoundsValue, invalidated, perlinActive, perlinSeed, perlinScale,
+        perlinOctaves }
+```
+
+`pattern` is a row-major `size` × `size` window centered on the cell being tested, where `size` is
+odd — 1, 3, 5, or 7. Each entry matches an IntGrid value: `0` matches anything, `+v` requires the
+cell to equal `v`, and `-v` requires it not to equal `v`.
+
+LDtk evaluates these rules on load and writes the result into each layer instance's
+`autoLayerTiles`. Nothing in this server evaluates them, so a rule you add by hand shows up only
+after LDtk reopens the project.
+
 ## Development
 
 Unit tests cover the pure logic: typed-field encoding, project tree manipulation, and schema
@@ -178,5 +204,16 @@ cargo +stable clippy --all-targets --all-features
 - New levels append to the root `levels`, or to the first world in multi-world projects.
 - The JSON-schema pass in `validate_project` is best-effort, because the official schema is loose.
   The structural checks remain the authoritative gate.
-- The server exposes no MCP prompts, and it can't author AutoLayer rules. See `PLAN.md` for the
-  planned design.
+- The server exposes no MCP prompts, and it can't author AutoLayer rules.
+
+## Roadmap
+
+- **MCP prompts.** Parameterized workflow guides served through `list_prompts` and `get_prompt`:
+  walking a new level from `open_project` to `save_project`, adding an IntGrid collision layer
+  plus the AutoLayer it drives, and reviewing edits before a save.
+- **AutoLayer rule authoring.** Tools to create rule groups and rules against the shape documented
+  earlier, so an agent can set up "draw tile T wherever the IntGrid holds value V" without opening
+  LDtk.
+- **In-process rule evaluation** (stretch). Computing `autoLayerTiles` from the IntGrid and the
+  rules would let `render_level` show real tiles instead of IntGrid value colors, closing the gap
+  described in *Visual feedback*.
