@@ -1,6 +1,6 @@
 //! Typed field-instance encoding.
 //!
-//! LDtk loads field values from `realEditorValues` (see
+//! `LDtk` loads field values from `realEditorValues` (see
 //! `src/electron.renderer/data/inst/FieldInstance.hx` `fromJson`), not from `__value`.
 //! Every value is stored as one of four `ValueWrapper` variants
 //! (`V_Int`, `V_Float`, `V_Bool`, `V_String`). This module reproduces that encoding
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(int_to_hex(0xFF_8000), "#FF8000");
         assert_eq!(int_to_hex(0), "#000000");
         // High bits beyond 24 are masked off.
-        assert_eq!(int_to_hex(0xABFF_8000_u32 as i64), "#FF8000");
+        assert_eq!(int_to_hex(i64::from(0xABFF_8000_u32)), "#FF8000");
     }
 
     #[test]

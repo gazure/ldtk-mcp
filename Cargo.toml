@@ -23,3 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonschema = { version = "0.46.5", default-features = false }
 png = "0.17"
 base64 = "0.22"
+
+[lints.clippy]
+# priority -1 so individual lint keys below can override the group.
+pedantic = { level = "warn", priority = -1 }

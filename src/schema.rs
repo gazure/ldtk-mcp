@@ -1,4 +1,4 @@
-//! Best-effort JSON-schema validation against the bundled LDtk schema.
+//! Best-effort JSON-schema validation against the bundled `LDtk` schema.
 //!
 //! The official schema (`JSON_SCHEMA.json`) is intentionally loose, so violations are
 //! reported as non-fatal warnings; the structural checks in `validate_project` remain the

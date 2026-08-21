@@ -1,4 +1,4 @@
-//! Semantic diff between two LDtk project roots, for `preview_changes`.
+//! Semantic diff between two `LDtk` project roots, for `preview_changes`.
 //!
 //! Compares an `old` root (the state on disk) against a `new` root (the in-memory edits)
 //! and produces a concise, human-readable list of changes rather than a raw JSON patch:
@@ -9,16 +9,15 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 /// Content counts for one layer instance:
-/// (non-zero IntGrid cells, grid tiles, auto-layer tiles, entity instances).
+/// (non-zero `IntGrid` cells, grid tiles, auto-layer tiles, entity instances).
 ///
 /// Shared with `get_level` so the preview and the level summary never drift.
 pub fn layer_counts(li: &Value) -> (usize, usize, usize, usize) {
-    let arr_len = |k: &str| li.get(k).and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    let arr_len = |k: &str| li.get(k).and_then(Value::as_array).map_or(0, std::vec::Vec::len);
     let intgrid_nonzero = li
         .get("intGridCsv")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter(|v| v.as_i64() != Some(0)).count())
-        .unwrap_or(0);
+        .map_or(0, |a| a.iter().filter(|v| v.as_i64() != Some(0)).count());
     (
         intgrid_nonzero,
         arr_len("gridTiles"),
@@ -126,8 +125,7 @@ fn diff_level_pair(o: &Value, n: &Value, out: &mut Vec<String>) {
     let fi_count = |l: &Value| {
         l.get("fieldInstances")
             .and_then(Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0)
+            .map_or(0, std::vec::Vec::len)
     };
     if fi_count(o) != fi_count(n) {
         out.push(format!("~ level '{name}' fields {} -> {}", fi_count(o), fi_count(n)));

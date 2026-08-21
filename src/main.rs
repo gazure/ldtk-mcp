@@ -1,4 +1,4 @@
-//! ldtk-mcp: a Model Context Protocol server for editing LDtk projects.
+//! ldtk-mcp: a Model Context Protocol server for editing `LDtk` projects.
 
 mod diff;
 mod fields;

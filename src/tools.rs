@@ -1,4 +1,4 @@
-//! MCP tool surface for editing LDtk projects.
+//! MCP tool surface for editing `LDtk` projects.
 
 use std::{
     collections::HashMap,
@@ -101,7 +101,7 @@ pub struct LevelKey {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct CreateLevelArgs {
-    /// Unique identifier for the new level (e.g. "Cave_01").
+    /// Unique identifier for the new level (e.g. "`Cave_01`").
     pub identifier: String,
     /// Level width in pixels. Defaults to the project's `defaultLevelWidth`.
     pub px_wid: Option<i64>,
@@ -119,7 +119,7 @@ pub struct Rect {
     pub w: i64,
     /// Height in cells.
     pub h: i64,
-    /// IntGrid value to write (0 = empty, 1+ = a defined value).
+    /// `IntGrid` value to write (0 = empty, 1+ = a defined value).
     pub value: i64,
 }
 
@@ -127,7 +127,7 @@ pub struct Rect {
 pub struct SetIntGridArgs {
     /// Level identifier, iid, or uid.
     pub level: String,
-    /// IntGrid layer identifier.
+    /// `IntGrid` layer identifier.
     pub layer: String,
     /// Optional full row-major grid (length must equal cWid*cHei). Replaces the whole layer.
     pub csv: Option<Vec<i64>>,
@@ -247,7 +247,7 @@ pub struct GetEntitiesArgs {
 pub struct GetIntGridArgs {
     /// Level identifier, iid, or uid.
     pub level: String,
-    /// IntGrid layer identifier or iid.
+    /// `IntGrid` layer identifier or iid.
     pub layer: String,
 }
 
@@ -299,9 +299,9 @@ pub struct CreateWorldArgs {
     pub identifier: String,
     /// World layout: `Free`, `GridVania`, `LinearHorizontal`, or `LinearVertical`. Default `Free`.
     pub world_layout: Option<String>,
-    /// World grid width in pixels (GridVania). Default 256.
+    /// World grid width in pixels (`GridVania`). Default 256.
     pub world_grid_width: Option<i64>,
-    /// World grid height in pixels (GridVania). Default 256.
+    /// World grid height in pixels (`GridVania`). Default 256.
     pub world_grid_height: Option<i64>,
     /// Default new-level width in pixels. Defaults to the project's `defaultLevelWidth`.
     pub default_level_width: Option<i64>,
@@ -315,9 +315,9 @@ pub struct SetWorldLayoutArgs {
     pub world: String,
     /// New world layout: `Free`, `GridVania`, `LinearHorizontal`, or `LinearVertical`.
     pub world_layout: Option<String>,
-    /// New world grid width in pixels (GridVania).
+    /// New world grid width in pixels (`GridVania`).
     pub world_grid_width: Option<i64>,
-    /// New world grid height in pixels (GridVania).
+    /// New world grid height in pixels (`GridVania`).
     pub world_grid_height: Option<i64>,
 }
 
@@ -345,19 +345,19 @@ pub struct DeleteEntityArgs {
 pub struct FloodFillIntGridArgs {
     /// Level identifier, iid, or uid.
     pub level: String,
-    /// IntGrid layer identifier or iid.
+    /// `IntGrid` layer identifier or iid.
     pub layer: String,
     /// Start grid X (column).
     pub cx: i64,
     /// Start grid Y (row).
     pub cy: i64,
-    /// IntGrid value to fill the contiguous region with.
+    /// `IntGrid` value to fill the contiguous region with.
     pub value: i64,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct IntGridValueSpec {
-    /// The IntGrid value (1-based, matching LDtk).
+    /// The `IntGrid` value (1-based, matching `LDtk`).
     pub value: i64,
     /// Optional human-readable identifier for the value.
     pub identifier: Option<String>,
@@ -367,7 +367,7 @@ pub struct IntGridValueSpec {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct AddIntGridValuesArgs {
-    /// IntGrid layer definition to extend, by identifier or uid.
+    /// `IntGrid` layer definition to extend, by identifier or uid.
     pub layer: String,
     /// Value definitions to add or update (upserted by `value`).
     pub values: Vec<IntGridValueSpec>,
@@ -733,7 +733,7 @@ impl LdtkServer {
             if args.include_auto_tiles.unwrap_or(false) {
                 obj.insert("autoLayerTiles".into(), json!(auto.cloned().unwrap_or_default()));
             } else {
-                obj.insert("autoLayerTileCount".into(), json!(auto.map(|a| a.len()).unwrap_or(0)));
+                obj.insert("autoLayerTileCount".into(), json!(auto.map_or(0, std::vec::Vec::len)));
             }
             Ok(pretty(&out))
         })
@@ -916,8 +916,7 @@ impl LdtkServer {
                 .root
                 .get("levels")
                 .and_then(Value::as_array)
-                .map(|a| !a.is_empty())
-                .unwrap_or(false);
+                .is_some_and(|a| !a.is_empty());
             let world = p
                 .create_world(
                     &args.identifier,
@@ -1519,8 +1518,7 @@ impl LdtkServer {
                         let len = li
                             .get("intGridCsv")
                             .and_then(Value::as_array)
-                            .map(|a| a.len())
-                            .unwrap_or(0);
+                            .map_or(0, std::vec::Vec::len);
                         if len as i64 != cw * ch {
                             issues.push(format!("{lid}/{li_id}: intGridCsv len {len} != {cw}x{ch}"));
                         }

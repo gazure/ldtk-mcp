@@ -1,7 +1,7 @@
-//! Pure-Rust software rasterizer that renders an LDtk level to a PNG.
+//! Pure-Rust software rasterizer that renders an `LDtk` level to a PNG.
 //!
 //! Closes the perceive→act→verify loop: after editing, an agent can render the level and
-//! actually see the result. Layers are drawn bottom-to-top — IntGrid cells as their value
+//! actually see the result. Layers are drawn bottom-to-top — `IntGrid` cells as their value
 //! colors, tile/auto layers as real pixels sampled from the decoded tileset images, and
 //! entities as their tile sprite or a colored box. Tilesets that can't be decoded
 //! (`.aseprite`, embedded) render as a magenta placeholder so a render never fails outright.
@@ -22,7 +22,7 @@ use crate::{
 
 /// Magenta placeholder for tiles whose tileset image is unavailable.
 const PLACEHOLDER: [u8; 4] = [0xFF, 0x00, 0xFF, 0xFF];
-/// LDtk's default level background, used when a level has no `__bgColor`.
+/// `LDtk`'s default level background, used when a level has no `__bgColor`.
 const DEFAULT_BG: [u8; 4] = [0x69, 0x6A, 0x79, 0xFF];
 
 /// Options controlling render output size and layer selection.
@@ -79,10 +79,10 @@ impl Canvas {
 
     /// Alpha-composite `c` over the pixel at `(x, y)` (out-of-bounds is a no-op).
     fn blend(&mut self, x: i64, y: i64, c: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w as i64 || y >= self.h as i64 {
+        if x < 0 || y < 0 || x >= i64::from(self.w) || y >= i64::from(self.h) {
             return;
         }
-        let a = c[3] as u32;
+        let a = u32::from(c[3]);
         if a == 0 {
             return;
         }
@@ -93,9 +93,9 @@ impl Canvas {
         }
         let ia = 255 - a;
         for (k, &cc) in c.iter().enumerate().take(3) {
-            self.px[i + k] = ((cc as u32 * a + self.px[i + k] as u32 * ia) / 255) as u8;
+            self.px[i + k] = ((u32::from(cc) * a + u32::from(self.px[i + k]) * ia) / 255) as u8;
         }
-        self.px[i + 3] = (a + self.px[i + 3] as u32 * ia / 255).min(255) as u8;
+        self.px[i + 3] = (a + u32::from(self.px[i + 3]) * ia / 255).min(255) as u8;
     }
 
     fn fill_rect(&mut self, x: i64, y: i64, w: i64, h: i64, c: [u8; 4]) {
@@ -233,7 +233,7 @@ fn blit(
                 v = sh - 1 - v;
             }
             let (spx, spy) = (sx + u, sy + v);
-            if spx < 0 || spy < 0 || spx >= src.w as i64 || spy >= src.h as i64 {
+            if spx < 0 || spy < 0 || spx >= i64::from(src.w) || spy >= i64::from(src.h) {
                 continue;
             }
             let si = ((spy as u32 * src.w + spx as u32) * 4) as usize;
@@ -241,7 +241,7 @@ fn blit(
                 src.rgba[si],
                 src.rgba[si + 1],
                 src.rgba[si + 2],
-                (src.rgba[si + 3] as f64 * opacity) as u8,
+                (f64::from(src.rgba[si + 3]) * opacity) as u8,
             ];
             dst.blend(dx + ox, dy + oy, c);
         }
@@ -266,8 +266,7 @@ fn draw_intgrid(canvas: &mut Canvas, p: &Project, li: &Value, id: &str, grid: i6
             let c = d
                 .get("color")
                 .and_then(Value::as_str)
-                .map(hex_rgba)
-                .unwrap_or([0xFF, 0xFF, 0xFF, 0xFF]);
+                .map_or([0xFF, 0xFF, 0xFF, 0xFF], hex_rgba);
             color_of.insert(v, c);
         }
     }
@@ -279,7 +278,7 @@ fn draw_intgrid(canvas: &mut Canvas, p: &Project, li: &Value, id: &str, grid: i6
         let cx = (i as i64) % cw;
         let cy = (i as i64) / cw;
         let mut c = *color_of.get(&v).unwrap_or(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        c[3] = (c[3] as f64 * opacity) as u8;
+        c[3] = (f64::from(c[3]) * opacity) as u8;
         canvas.fill_rect(cx * grid + ox, cy * grid + oy, grid, grid, c);
     }
 }
@@ -299,10 +298,7 @@ fn draw_tiles(
         .and_then(Value::as_i64)
         .or_else(|| li.get("__tilesetDefUid").and_then(Value::as_i64));
     // Source tile size comes from the tileset def; fall back to the layer grid size.
-    let src_size = uid
-        .and_then(|u| p.tileset_def(u))
-        .map(|g| g.tile_grid_size)
-        .unwrap_or(grid);
+    let src_size = uid.and_then(|u| p.tileset_def(u)).map_or(grid, |g| g.tile_grid_size);
     for key in ["gridTiles", "autoLayerTiles"] {
         let Some(tiles) = li.get(key).and_then(Value::as_array) else {
             continue;
@@ -312,17 +308,14 @@ fn draw_tiles(
             let dy = arr_i64(t, "px", 1).unwrap_or(0) + oy;
             let f = t.get("f").and_then(Value::as_i64).unwrap_or(0);
             let a = t.get("a").and_then(Value::as_f64).unwrap_or(1.0) * opacity;
-            match uid.and_then(|u| cache.get(u)) {
-                Some(img) => {
-                    let sx = arr_i64(t, "src", 0).unwrap_or(0);
-                    let sy = arr_i64(t, "src", 1).unwrap_or(0);
-                    blit(canvas, img, sx, sy, src_size, src_size, dx, dy, grid, grid, f, a);
-                }
-                None => {
-                    let mut c = PLACEHOLDER;
-                    c[3] = (255.0 * a) as u8;
-                    canvas.fill_rect(dx, dy, grid, grid, c);
-                }
+            if let Some(img) = uid.and_then(|u| cache.get(u)) {
+                let sx = arr_i64(t, "src", 0).unwrap_or(0);
+                let sy = arr_i64(t, "src", 1).unwrap_or(0);
+                blit(canvas, img, sx, sy, src_size, src_size, dx, dy, grid, grid, f, a);
+            } else {
+                let mut c = PLACEHOLDER;
+                c[3] = (255.0 * a) as u8;
+                canvas.fill_rect(dx, dy, grid, grid, c);
             }
         }
     }
@@ -354,8 +347,7 @@ fn draw_entities(canvas: &mut Canvas, cache: &mut TilesetCache, li: &Value, ox: 
         let color = e
             .get("__smartColor")
             .and_then(Value::as_str)
-            .map(hex_rgba)
-            .unwrap_or([0x94, 0xD9, 0xB3, 0xFF]);
+            .map_or([0x94, 0xD9, 0xB3, 0xFF], hex_rgba);
         let mut fill = color;
         fill[3] = (90.0 * opacity) as u8;
         canvas.fill_rect(x, y, w, h, fill);
@@ -368,7 +360,7 @@ fn draw_entities(canvas: &mut Canvas, cache: &mut TilesetCache, li: &Value, ox: 
 /// Compute output dimensions and scale: explicit `scale` wins; otherwise fit the longest edge
 /// to `max_px` (integer upscaling for crisp pixels, fractional downscaling for oversized levels).
 fn output_dims(w: u32, h: u32, opts: &RenderOpts) -> (u32, u32, f64) {
-    let longest = w.max(h) as f64;
+    let longest = f64::from(w.max(h));
     let scale = match opts.scale {
         Some(s) if s > 0.0 => s,
         _ => {
@@ -380,8 +372,8 @@ fn output_dims(w: u32, h: u32, opts: &RenderOpts) -> (u32, u32, f64) {
             }
         }
     };
-    let ow = ((w as f64 * scale).round() as u32).max(1);
-    let oh = ((h as f64 * scale).round() as u32).max(1);
+    let ow = ((f64::from(w) * scale).round() as u32).max(1);
+    let oh = ((f64::from(h) * scale).round() as u32).max(1);
     (ow, oh, scale)
 }
 
@@ -392,9 +384,9 @@ fn resample(src: &Canvas, ow: u32, oh: u32) -> Canvas {
         px: vec![0u8; (ow as usize) * (oh as usize) * 4],
     };
     for oy in 0..oh {
-        let sy = (oy as u64 * src.h as u64 / oh as u64) as u32;
+        let sy = (u64::from(oy) * u64::from(src.h) / u64::from(oh)) as u32;
         for ox in 0..ow {
-            let sx = (ox as u64 * src.w as u64 / ow as u64) as u32;
+            let sx = (u64::from(ox) * u64::from(src.w) / u64::from(ow)) as u32;
             let si = ((sy * src.w + sx) * 4) as usize;
             let di = ((oy * ow + ox) * 4) as usize;
             out.px[di..di + 4].copy_from_slice(&src.px[si..si + 4]);
@@ -423,8 +415,7 @@ pub fn render(p: &Project, r: LevelRef, opts: &RenderOpts) -> Result<RenderOutpu
     let bg = level
         .get("__bgColor")
         .and_then(Value::as_str)
-        .map(hex_rgba)
-        .unwrap_or(DEFAULT_BG);
+        .map_or(DEFAULT_BG, hex_rgba);
 
     let mut canvas = Canvas::new(px_wid as u32, px_hei as u32, bg);
     let mut cache = TilesetCache::new(p);
@@ -536,7 +527,7 @@ mod tests {
         c.blend(0, 0, [255, 255, 255, 128]);
         let got = px(&c.px, 1, 0, 0);
         // ~50% white over black.
-        assert!((120..=135).contains(&(got[0] as i32)), "{got:?}");
+        assert!((120..=135).contains(&i32::from(got[0])), "{got:?}");
     }
 
     #[test]
