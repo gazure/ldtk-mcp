@@ -217,3 +217,7 @@ cargo +stable clippy --all-targets --all-features
 - **In-process rule evaluation** (stretch). Computing `autoLayerTiles` from the IntGrid and the
   rules would let `render_level` show real tiles instead of IntGrid value colors, closing the gap
   described in *Visual feedback*.
+
+## License
+
+Released under the [MIT License](LICENSE).
