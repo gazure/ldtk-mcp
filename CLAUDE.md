@@ -1,8 +1,5 @@
-#
-An MCP server for LDTK (level design toolkit)
+# ldtk-mcp
 
-## rules
-
-- put sample levels in samples/
-- testing scripts in scripts/
-- code should pass +nightly fmt and +stable clippy
+- Sample levels go in `samples/`, test scripts in `scripts/`.
+- Code must pass `cargo +nightly fmt --all -- --check` and
+  `cargo +stable clippy --all-targets --all-features`.
