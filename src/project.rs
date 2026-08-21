@@ -1,4 +1,4 @@
-//! In-memory LDtk project state.
+//! In-memory `LDtk` project state.
 //!
 //! The whole `.ldtk` file is kept as a `serde_json::Value` (with `preserve_order`)
 //! so that editor-only fields and key ordering survive a load/save round-trip.
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 /// Maximum number of pre-mutation snapshots retained for undo; oldest are evicted.
 const UNDO_CAP: usize = 20;
 
-/// A loaded LDtk project plus the path it came from.
+/// A loaded `LDtk` project plus the path it came from.
 pub struct Project {
     pub path: PathBuf,
     pub root: Value,
@@ -86,10 +86,7 @@ impl Project {
     }
 
     fn project_dir(&self) -> PathBuf {
-        self.path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+        self.path.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
     /// Resolve a project-relative path (e.g. a tileset `relPath`) against the project directory.
@@ -108,7 +105,7 @@ impl Project {
             let (rel, needs) = {
                 let lvl = self.level_ref(r).unwrap();
                 let rel = lvl.get("externalRelPath").and_then(Value::as_str).map(String::from);
-                let needs = lvl.get("layerInstances").map(Value::is_null).unwrap_or(true);
+                let needs = lvl.get("layerInstances").is_none_or(Value::is_null);
                 (rel, needs)
             };
             if let (Some(rel), true) = (rel, needs) {
@@ -145,14 +142,13 @@ impl Project {
             for r in self.all_level_refs() {
                 let rel = {
                     let lvl = self.level_value_mut(r)?;
-                    let rel = match lvl.get("externalRelPath").and_then(Value::as_str) {
-                        Some(p) => p.to_string(),
-                        None => {
-                            let id = lvl.get("identifier").and_then(Value::as_str).unwrap_or("Level");
-                            let rel = format!("{id}.ldtkl");
-                            lvl["externalRelPath"] = json!(rel);
-                            rel
-                        }
+                    let rel = if let Some(p) = lvl.get("externalRelPath").and_then(Value::as_str) {
+                        p.to_string()
+                    } else {
+                        let id = lvl.get("identifier").and_then(Value::as_str).unwrap_or("Level");
+                        let rel = format!("{id}.ldtkl");
+                        lvl["externalRelPath"] = json!(rel);
+                        rel
                     };
                     rel
                 };
@@ -313,11 +309,10 @@ impl Project {
         self.defs()
             .and_then(|d| d.get(key))
             .and_then(Value::as_array)
-            .map(|a| {
+            .is_some_and(|a| {
                 a.iter()
                     .any(|d| d.get("identifier").and_then(Value::as_str) == Some(identifier))
             })
-            .unwrap_or(false)
     }
 
     pub fn layer_defs(&self) -> Vec<LayerDef> {
@@ -451,7 +446,7 @@ impl Project {
     pub fn find_level(&self, key: &str) -> Option<LevelRef> {
         self.all_level_refs()
             .into_iter()
-            .find(|r| self.level_ref(*r).map(|lvl| level_matches(lvl, key)).unwrap_or(false))
+            .find(|r| self.level_ref(*r).is_some_and(|lvl| level_matches(lvl, key)))
     }
 
     /// Immutable access to a level by location.
@@ -506,7 +501,7 @@ impl Project {
     }
 
     /// The `intGridValues` array from the layer definition matching `layer_id`
-    /// (by `identifier`), describing what each IntGrid number means.
+    /// (by `identifier`), describing what each `IntGrid` number means.
     pub fn intgrid_value_defs(&self, layer_id: &str) -> Vec<Value> {
         self.defs()
             .and_then(|d| d.get("layers"))
@@ -539,8 +534,7 @@ impl Project {
         let tileset_rel = def
             .tileset_def_uid
             .and_then(|u| self.tileset_rel_path(u))
-            .map(Value::from)
-            .unwrap_or(Value::Null);
+            .map_or(Value::Null, Value::from);
         let int_grid_csv = if def.kind == "IntGrid" {
             json!(vec![0i64; (c_wid * c_hei).max(0) as usize])
         } else {
@@ -555,7 +549,7 @@ impl Project {
             "__opacity": def.display_opacity,
             "__pxTotalOffsetX": def.px_offset_x,
             "__pxTotalOffsetY": def.px_offset_y,
-            "__tilesetDefUid": def.tileset_def_uid.map(Value::from).unwrap_or(Value::Null),
+            "__tilesetDefUid": def.tileset_def_uid.map_or(Value::Null, Value::from),
             "__tilesetRelPath": tileset_rel,
             "iid": Self::new_iid(),
             "levelId": level_uid,
@@ -606,8 +600,8 @@ impl Project {
             .collect();
         // AutoLayer binds its tileset via autoTilesetDefUid; Tiles via tilesetDefUid.
         let (tileset_field, auto_tileset_field) = match kind {
-            "AutoLayer" => (Value::Null, tileset_def_uid.map(Value::from).unwrap_or(Value::Null)),
-            _ => (tileset_def_uid.map(Value::from).unwrap_or(Value::Null), Value::Null),
+            "AutoLayer" => (Value::Null, tileset_def_uid.map_or(Value::Null, Value::from)),
+            _ => (tileset_def_uid.map_or(Value::Null, Value::from), Value::Null),
         };
         let uid = self.alloc_uid()?;
         let def = json!({
@@ -719,7 +713,7 @@ impl Project {
             "color": color,
             "renderMode": render_mode,
             "showName": true,
-            "tilesetId": tileset_uid.map(Value::from).unwrap_or(Value::Null),
+            "tilesetId": tileset_uid.map_or(Value::Null, Value::from),
             "tileRenderMode": "FitInside",
             "tileRect": tile_rect,
             "nineSliceBorders": [],
@@ -739,7 +733,7 @@ impl Project {
     }
 
     /// Create a new enum definition from a list of value identifiers.
-    pub fn create_enum(&mut self, identifier: &str, values: Vec<String>) -> Result<Value> {
+    pub fn create_enum(&mut self, identifier: &str, values: &[String]) -> Result<Value> {
         if self.def_identifier_exists("enums", identifier) {
             bail!("an enum '{identifier}' already exists");
         }
@@ -818,7 +812,7 @@ impl Project {
             .and_then(|e| e.get("uid").and_then(Value::as_i64))
     }
 
-    /// Build a FieldDef JSON value populated with schema-required editor defaults.
+    /// Build a `FieldDef` JSON value populated with schema-required editor defaults.
     #[allow(clippy::too_many_arguments)]
     fn build_field_def(
         &mut self,
@@ -858,8 +852,8 @@ impl Project {
             "canBeNull": can_be_null,
             "arrayMinLength": Value::Null,
             "arrayMaxLength": Value::Null,
-            "min": min.map(Value::from).unwrap_or(Value::Null),
-            "max": max.map(Value::from).unwrap_or(Value::Null),
+            "min": min.map_or(Value::Null, Value::from),
+            "max": max.map_or(Value::Null, Value::from),
             "regex": Value::Null,
             "acceptFileTypes": Value::Null,
             "defaultOverride": Value::Null,
@@ -949,7 +943,7 @@ impl Project {
         Ok(def)
     }
 
-    /// Append or update IntGrid value definitions on an existing IntGrid layer def, addressed by
+    /// Append or update `IntGrid` value definitions on an existing `IntGrid` layer def, addressed by
     /// identifier or uid. Each spec is `{ value, identifier?, color? }`; entries are upserted by
     /// `value` (1-based) and the array is kept sorted by value. Returns `(added, updated)` counts.
     ///
@@ -1011,25 +1005,22 @@ impl Project {
                 }
             }
 
-            match arr
+            if let Some(existing) = arr
                 .iter_mut()
                 .find(|e| e.get("value").and_then(Value::as_i64) == Some(value))
             {
-                Some(existing) => {
-                    existing["identifier"] = identifier.map(Value::from).unwrap_or(Value::Null);
-                    existing["color"] = json!(color);
-                    updated += 1;
-                }
-                None => {
-                    arr.push(json!({
-                        "value": value,
-                        "identifier": identifier,
-                        "color": color,
-                        "groupUid": 0,
-                        "tile": Value::Null,
-                    }));
-                    added += 1;
-                }
+                existing["identifier"] = identifier.map_or(Value::Null, Value::from);
+                existing["color"] = json!(color);
+                updated += 1;
+            } else {
+                arr.push(json!({
+                    "value": value,
+                    "identifier": identifier,
+                    "color": color,
+                    "groupUid": 0,
+                    "tile": Value::Null,
+                }));
+                added += 1;
             }
         }
         arr.sort_by_key(|e| e.get("value").and_then(Value::as_i64).unwrap_or(0));
@@ -1044,14 +1035,12 @@ impl Project {
             .root
             .get("levels")
             .and_then(Value::as_array)
-            .map(|a| a.is_empty())
-            .unwrap_or(true);
+            .is_none_or(std::vec::Vec::is_empty);
         let has_worlds = self
             .root
             .get("worlds")
             .and_then(Value::as_array)
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|a| !a.is_empty());
         if root_empty && has_worlds {
             Some(0)
         } else {
@@ -1118,32 +1107,29 @@ impl Project {
             "layerInstances": layer_instances
         });
 
-        match target_world {
-            Some(w) => {
-                let worlds = self
-                    .root
-                    .get_mut("worlds")
-                    .and_then(Value::as_array_mut)
-                    .ok_or_else(|| anyhow!("no `worlds` array"))?;
-                let world = worlds.get_mut(w).ok_or_else(|| anyhow!("world index out of range"))?;
-                if !world.get("levels").map(Value::is_array).unwrap_or(false) {
-                    world["levels"] = json!([]);
-                }
-                world["levels"].as_array_mut().unwrap().push(level.clone());
+        if let Some(w) = target_world {
+            let worlds = self
+                .root
+                .get_mut("worlds")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow!("no `worlds` array"))?;
+            let world = worlds.get_mut(w).ok_or_else(|| anyhow!("world index out of range"))?;
+            if !world.get("levels").is_some_and(Value::is_array) {
+                world["levels"] = json!([]);
             }
-            None => {
-                let obj = self
-                    .root
-                    .as_object_mut()
-                    .ok_or_else(|| anyhow!("root is not an object"))?;
-                if !obj.contains_key("levels") || !obj["levels"].is_array() {
-                    obj.insert("levels".into(), json!([]));
-                }
-                obj.get_mut("levels")
-                    .and_then(Value::as_array_mut)
-                    .unwrap()
-                    .push(level.clone());
+            world["levels"].as_array_mut().unwrap().push(level.clone());
+        } else {
+            let obj = self
+                .root
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("root is not an object"))?;
+            if !obj.contains_key("levels") || !obj["levels"].is_array() {
+                obj.insert("levels".into(), json!([]));
             }
+            obj.get_mut("levels")
+                .and_then(Value::as_array_mut)
+                .unwrap()
+                .push(level.clone());
         }
         self.dirty = true;
         Ok(level)
@@ -1298,22 +1284,19 @@ impl Project {
             .and_then(Value::as_str)
             .unwrap_or("Level")
             .to_string();
-        let new_id = match identifier {
-            Some(s) => {
-                if self.find_level(s).is_some() {
-                    bail!("a level named '{s}' already exists");
-                }
-                s.to_string()
+        let new_id = if let Some(s) = identifier {
+            if self.find_level(s).is_some() {
+                bail!("a level named '{s}' already exists");
             }
-            None => {
-                let mut candidate = format!("{src_id}_copy");
-                let mut n = 2;
-                while self.find_level(&candidate).is_some() {
-                    candidate = format!("{src_id}_copy{n}");
-                    n += 1;
-                }
-                candidate
+            s.to_string()
+        } else {
+            let mut candidate = format!("{src_id}_copy");
+            let mut n = 2;
+            while self.find_level(&candidate).is_some() {
+                candidate = format!("{src_id}_copy{n}");
+                n += 1;
             }
+            candidate
         };
         let layout = self.layout_for(r);
         let px_wid = self
@@ -1323,12 +1306,12 @@ impl Project {
             .and_then(Value::as_i64)
             .unwrap_or(256);
         let (world_x, world_y) = self.next_world_position(px_wid, &layout);
-        let new_uid = self.alloc_uid()?;
+        let uid = self.alloc_uid()?;
 
         let mut lvl = self.level_ref(r).unwrap().clone();
         lvl["identifier"] = json!(new_id);
         lvl["iid"] = json!(Self::new_iid());
-        lvl["uid"] = json!(new_uid);
+        lvl["uid"] = json!(uid);
         lvl["worldX"] = json!(world_x);
         lvl["worldY"] = json!(world_y);
         lvl["__neighbours"] = json!([]);
@@ -1336,7 +1319,7 @@ impl Project {
         if let Some(insts) = lvl.get_mut("layerInstances").and_then(Value::as_array_mut) {
             for li in insts {
                 li["iid"] = json!(Self::new_iid());
-                li["levelId"] = json!(new_uid);
+                li["levelId"] = json!(uid);
             }
         }
         self.push_level(r, lvl.clone())?;
@@ -1415,7 +1398,7 @@ impl Project {
             .root
             .as_object_mut()
             .ok_or_else(|| anyhow!("root is not an object"))?;
-        if !obj.get("worlds").map(Value::is_array).unwrap_or(false) {
+        if !obj.get("worlds").is_some_and(Value::is_array) {
             obj.insert("worlds".into(), json!([]));
         }
         obj.get_mut("worlds")
@@ -1554,8 +1537,7 @@ impl Project {
                         let (pivot_x, pivot_y) = defs
                             .iter()
                             .find(|d| d.identifier == id)
-                            .map(|d| (d.pivot_x, d.pivot_y))
-                            .unwrap_or((0.0, 0.0));
+                            .map_or((0.0, 0.0), |d| (d.pivot_x, d.pivot_y));
                         let px_x = (cx as f64 * grid as f64 + pivot_x * grid as f64).round() as i64;
                         let px_y = (cy as f64 * grid as f64 + pivot_y * grid as f64).round() as i64;
                         e["__grid"] = json!([cx, cy]);
@@ -1602,7 +1584,7 @@ impl Project {
         }
     }
 
-    /// 4-connected flood fill on an IntGrid layer starting at `(cx, cy)`, replacing the
+    /// 4-connected flood fill on an `IntGrid` layer starting at `(cx, cy)`, replacing the
     /// contiguous region sharing the start cell's value. Returns the number of cells filled.
     pub fn flood_fill_intgrid(&mut self, r: LevelRef, layer_id: &str, cx: i64, cy: i64, value: i64) -> Result<usize> {
         let filled;
@@ -1668,7 +1650,7 @@ fn null_external_layer_instances(root: &mut Value) {
     let null_in = |levels: &mut Value| {
         if let Some(arr) = levels.as_array_mut() {
             for lvl in arr {
-                let external = lvl.get("externalRelPath").map(|v| !v.is_null()).unwrap_or(false);
+                let external = lvl.get("externalRelPath").is_some_and(|v| !v.is_null());
                 if external {
                     lvl["layerInstances"] = Value::Null;
                 }
@@ -1691,10 +1673,10 @@ fn null_external_layer_instances(root: &mut Value) {
 /// falls outside the new bounds.
 fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
     let grid = li.get("__gridSize").and_then(Value::as_i64).unwrap_or(16).max(1);
-    let old_cw = li.get("__cWid").and_then(Value::as_i64).unwrap_or(0);
-    let old_ch = li.get("__cHei").and_then(Value::as_i64).unwrap_or(0);
-    let new_cw = ((px_wid as f64 / grid as f64).ceil() as i64).max(0);
-    let new_ch = ((px_hei as f64 / grid as f64).ceil() as i64).max(0);
+    let old_cols = li.get("__cWid").and_then(Value::as_i64).unwrap_or(0);
+    let old_rows = li.get("__cHei").and_then(Value::as_i64).unwrap_or(0);
+    let new_cols = ((px_wid as f64 / grid as f64).ceil() as i64).max(0);
+    let new_rows = ((px_hei as f64 / grid as f64).ceil() as i64).max(0);
     let kind = li.get("__type").and_then(Value::as_str).unwrap_or("").to_string();
 
     // IntGrid: rebuild the CSV, preserving the overlapping top-left region; clear the
@@ -1705,13 +1687,13 @@ fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
             .and_then(Value::as_array)
             .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(0)).collect())
             .unwrap_or_default();
-        let mut grid_csv = vec![0i64; (new_cw * new_ch).max(0) as usize];
-        let copy_w = old_cw.min(new_cw);
-        let copy_h = old_ch.min(new_ch);
+        let mut grid_csv = vec![0i64; (new_cols * new_rows).max(0) as usize];
+        let copy_w = old_cols.min(new_cols);
+        let copy_h = old_rows.min(new_rows);
         for y in 0..copy_h {
             for x in 0..copy_w {
-                let oi = (y * old_cw + x) as usize;
-                let ni = (y * new_cw + x) as usize;
+                let oi = (y * old_cols + x) as usize;
+                let ni = (y * new_cols + x) as usize;
                 if oi < old.len() && ni < grid_csv.len() {
                     grid_csv[ni] = old[oi];
                 }
@@ -1725,27 +1707,20 @@ fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
     for tiles_key in ["gridTiles", "autoLayerTiles"] {
         if let Some(tiles) = li.get_mut(tiles_key).and_then(Value::as_array_mut) {
             tiles.retain(|t| {
-                t.get("px")
-                    .and_then(Value::as_array)
-                    .map(|p| {
-                        let x = p.first().and_then(Value::as_i64).unwrap_or(0);
-                        let y = p.get(1).and_then(Value::as_i64).unwrap_or(0);
-                        x >= 0 && y >= 0 && x < px_wid && y < px_hei
-                    })
-                    .unwrap_or(false)
+                t.get("px").and_then(Value::as_array).is_some_and(|p| {
+                    let x = p.first().and_then(Value::as_i64).unwrap_or(0);
+                    let y = p.get(1).and_then(Value::as_i64).unwrap_or(0);
+                    x >= 0 && y >= 0 && x < px_wid && y < px_hei
+                })
             });
             for t in tiles.iter_mut() {
-                let (x, y) = t
-                    .get("px")
-                    .and_then(Value::as_array)
-                    .map(|p| {
-                        (
-                            p.first().and_then(Value::as_i64).unwrap_or(0),
-                            p.get(1).and_then(Value::as_i64).unwrap_or(0),
-                        )
-                    })
-                    .unwrap_or((0, 0));
-                t["d"] = json!([(y / grid) * new_cw + (x / grid)]);
+                let (x, y) = t.get("px").and_then(Value::as_array).map_or((0, 0), |p| {
+                    (
+                        p.first().and_then(Value::as_i64).unwrap_or(0),
+                        p.get(1).and_then(Value::as_i64).unwrap_or(0),
+                    )
+                });
+                t["d"] = json!([(y / grid) * new_cols + (x / grid)]);
             }
         }
     }
@@ -1753,29 +1728,25 @@ fn resize_layer_instance(li: &mut Value, px_wid: i64, px_hei: i64) {
     // Clip entity instances whose grid cell now falls outside the level.
     if let Some(ents) = li.get_mut("entityInstances").and_then(Value::as_array_mut) {
         ents.retain(|e| {
-            e.get("__grid")
-                .and_then(Value::as_array)
-                .map(|g| {
-                    let cx = g.first().and_then(Value::as_i64).unwrap_or(0);
-                    let cy = g.get(1).and_then(Value::as_i64).unwrap_or(0);
-                    cx >= 0 && cy >= 0 && cx < new_cw && cy < new_ch
-                })
-                .unwrap_or(true)
+            e.get("__grid").and_then(Value::as_array).is_none_or(|g| {
+                let cx = g.first().and_then(Value::as_i64).unwrap_or(0);
+                let cy = g.get(1).and_then(Value::as_i64).unwrap_or(0);
+                cx >= 0 && cy >= 0 && cx < new_cols && cy < new_rows
+            })
         });
     }
 
-    li["__cWid"] = json!(new_cw);
-    li["__cHei"] = json!(new_ch);
+    li["__cWid"] = json!(new_cols);
+    li["__cHei"] = json!(new_rows);
 }
 
-/// Cheap non-crypto seed for auto-layer rendering (LDtk just needs *a* number).
+/// Cheap non-crypto seed for auto-layer rendering (`LDtk` just needs *a* number).
 fn rng_seed() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    (nanos % 9_999_999) as i64
+        .map_or(0, |d| d.subsec_nanos());
+    i64::from(nanos % 9_999_999)
 }
 
 #[cfg(test)]
@@ -1837,7 +1808,7 @@ mod tests {
         let chest = &defs[0];
         assert_eq!(chest.identifier, "Chest");
         assert_eq!(chest.width, 24);
-        assert_eq!(chest.pivot_y, 1.0);
+        assert!((chest.pivot_y - 1.0).abs() < f64::EPSILON);
         assert_eq!(chest.tags, vec!["loot".to_string()]);
     }
 
@@ -2489,15 +2460,13 @@ mod tests {
     #[test]
     fn create_enum_builds_values() {
         let mut p = project(sample_defs());
-        let def = p
-            .create_enum("Direction", vec!["North".into(), "South".into()])
-            .unwrap();
+        let def = p.create_enum("Direction", &["North".into(), "South".into()]).unwrap();
         let vals = def.get("values").and_then(Value::as_array).unwrap();
         assert_eq!(vals.len(), 2);
         assert_eq!(vals[0].get("id").and_then(Value::as_str), Some("North"));
         assert_eq!(vals[0].get("color").and_then(Value::as_i64), Some(0));
         assert!(def.get("tags").and_then(Value::as_array).unwrap().is_empty());
-        assert!(p.create_enum("Direction", vec![]).is_err());
+        assert!(p.create_enum("Direction", &[]).is_err());
     }
 
     #[test]
@@ -2545,7 +2514,7 @@ mod tests {
     #[test]
     fn add_level_field_enum_resolves_uid() {
         let mut p = project(sample_defs());
-        let en = p.create_enum("Biome", vec!["Forest".into(), "Desert".into()]).unwrap();
+        let en = p.create_enum("Biome", &["Forest".into(), "Desert".into()]).unwrap();
         let uid = en.get("uid").and_then(Value::as_i64).unwrap();
         let def = p
             .add_level_field("biome", "Enum", false, true, None, None, Some("Biome"))

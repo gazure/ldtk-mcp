@@ -1,6 +1,6 @@
 //! Typed field-instance encoding.
 //!
-//! LDtk loads field values from `realEditorValues` (see
+//! `LDtk` loads field values from `realEditorValues` (see
 //! `src/electron.renderer/data/inst/FieldInstance.hx` `fromJson`), not from `__value`.
 //! Every value is stored as one of four `ValueWrapper` variants
 //! (`V_Int`, `V_Float`, `V_Bool`, `V_String`). This module reproduces that encoding
@@ -39,10 +39,12 @@ pub struct FieldDef {
 }
 
 /// Resolved location of an entity instance, used for `EntityRef` `__value`.
+///
+/// Every field is an `LDtk` `iid`, not an identifier or a uid.
 pub struct RefInfo {
-    pub layer_iid: String,
-    pub level_iid: String,
-    pub world_iid: String,
+    pub layer: String,
+    pub level: String,
+    pub world: String,
 }
 
 pub fn parse_field_def(v: &Value) -> Result<FieldDef, String> {
@@ -90,7 +92,7 @@ fn escape_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
-fn wrap(id: &str, param: Value) -> Value {
+fn wrap(id: &str, param: &Value) -> Value {
     json!({ "id": id, "params": [param] })
 }
 
@@ -170,9 +172,9 @@ impl Project {
                             .any(|e| e.get("iid").and_then(Value::as_str) == Some(entity_iid))
                         {
                             return Some(RefInfo {
-                                layer_iid: layer_iid.to_string(),
-                                level_iid: level_iid.to_string(),
-                                world_iid: world_iid.to_string(),
+                                layer: layer_iid.to_string(),
+                                level: level_iid.to_string(),
+                                world: world_iid.to_string(),
                             });
                         }
                     }
@@ -236,9 +238,54 @@ impl Project {
         }))
     }
 
+    /// Encode an `Enum` field, checking the value against the enum's declared identifiers.
+    ///
+    /// The value is checked only when the reference resolves to a declared enum, in either `enums`
+    /// or `externalEnums`. A reference that resolves to neither passes through unchecked.
+    fn encode_enum(&self, id: &str, name: &str, value: &Value) -> Result<(Value, Value), String> {
+        let s = value
+            .as_str()
+            .ok_or_else(|| format!("field '{id}' expects an enum value string"))?;
+        if let Some(values) = self.enum_values(name) {
+            if !values.contains(&s.to_string()) {
+                return Err(format!(
+                    "field '{id}': '{s}' is not a value of enum '{name}' (valid: {values:?})"
+                ));
+            }
+        }
+        Ok((json!(s), wrap("V_String", &json!(escape_string(s)))))
+    }
+
+    /// Encode an `EntityRef` field by resolving the target iid to its layer, level, and world.
+    ///
+    /// Accepts either a bare iid string or an object carrying `entityIid`. The target must already
+    /// exist in the project; a dangling reference is an error rather than a null.
+    fn encode_entity_ref(&self, id: &str, value: &Value) -> Result<(Value, Value), String> {
+        let iid = value
+            .as_str()
+            .map(String::from)
+            .or_else(|| value.get("entityIid").and_then(Value::as_str).map(String::from))
+            .ok_or_else(|| format!("field '{id}' expects an entity iid string"))?;
+        let info = self
+            .resolve_entity_ref(&iid)
+            .ok_or_else(|| format!("field '{id}': entity ref '{iid}' not found in project"))?;
+        Ok((
+            json!({
+                "entityIid": iid,
+                "layerIid": info.layer,
+                "levelIid": info.level,
+                "worldIid": info.world,
+            }),
+            wrap("V_String", &json!(iid)),
+        ))
+    }
+
     /// Encode a single scalar -> (`__value` entry, `realEditorValues` entry).
-    fn encode_one(&self, def: &FieldDef, v: &Value) -> Result<(Value, Value), String> {
-        if v.is_null() {
+    // Each match arm binds the scalar it just parsed, and the tile-rect and point arms destructure
+    // into the component names LDtk itself uses (x/y/w/h, cx/cy). Longer names would not say more.
+    #[allow(clippy::many_single_char_names)]
+    fn encode_one(&self, def: &FieldDef, value: &Value) -> Result<(Value, Value), String> {
+        if value.is_null() {
             if !def.can_be_null {
                 return Err(format!("field '{}' cannot be null", def.identifier));
             }
@@ -247,17 +294,19 @@ impl Project {
         let id = &def.identifier;
         Ok(match &def.kind {
             FieldKind::Int => {
-                let mut n = v.as_i64().ok_or_else(|| format!("field '{id}' expects an integer"))?;
+                let mut n = value
+                    .as_i64()
+                    .ok_or_else(|| format!("field '{id}' expects an integer"))?;
                 if let Some(mn) = def.min {
                     n = n.max(mn as i64);
                 }
                 if let Some(mx) = def.max {
                     n = n.min(mx as i64);
                 }
-                (json!(n), wrap("V_Int", json!(n)))
+                (json!(n), wrap("V_Int", &json!(n)))
             }
             FieldKind::Float => {
-                let mut f = v.as_f64().ok_or_else(|| format!("field '{id}' expects a number"))?;
+                let mut f = value.as_f64().ok_or_else(|| format!("field '{id}' expects a number"))?;
                 if let Some(mn) = def.min {
                     if f < mn {
                         f = mn;
@@ -268,73 +317,45 @@ impl Project {
                         f = mx;
                     }
                 }
-                (json!(f), wrap("V_Float", json!(f)))
+                (json!(f), wrap("V_Float", &json!(f)))
             }
             FieldKind::Bool => {
-                let b = v.as_bool().ok_or_else(|| format!("field '{id}' expects a boolean"))?;
-                (json!(b), wrap("V_Bool", json!(b)))
+                let b = value
+                    .as_bool()
+                    .ok_or_else(|| format!("field '{id}' expects a boolean"))?;
+                (json!(b), wrap("V_Bool", &json!(b)))
             }
             FieldKind::String | FieldKind::Text | FieldKind::Path => {
-                let s = v.as_str().ok_or_else(|| format!("field '{id}' expects a string"))?;
+                let s = value.as_str().ok_or_else(|| format!("field '{id}' expects a string"))?;
                 let esc = escape_string(s);
-                (json!(esc), wrap("V_String", json!(esc)))
+                (json!(esc), wrap("V_String", &json!(esc)))
             }
             FieldKind::Color => {
-                let n = match v {
+                let n = match value {
                     Value::String(s) => {
                         hex_to_int(s).ok_or_else(|| format!("field '{id}': invalid hex color '{s}'"))?
                     }
-                    Value::Number(_) => v.as_i64().unwrap(),
+                    Value::Number(_) => value.as_i64().unwrap(),
                     _ => return Err(format!("field '{id}' expects a hex color string")),
                 };
-                (json!(int_to_hex(n)), wrap("V_Int", json!(n)))
+                (json!(int_to_hex(n)), wrap("V_Int", &json!(n)))
             }
-            FieldKind::Enum(name) => {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| format!("field '{id}' expects an enum value string"))?;
-                if let Some(values) = self.enum_values(name) {
-                    if !values.contains(&s.to_string()) {
-                        return Err(format!(
-                            "field '{id}': '{s}' is not a value of enum '{name}' (valid: {values:?})"
-                        ));
-                    }
-                }
-                (json!(s), wrap("V_String", json!(escape_string(s))))
-            }
+            FieldKind::Enum(name) => self.encode_enum(id, name, value)?,
             FieldKind::Point => {
                 let (cx, cy) =
-                    parse_point(v).ok_or_else(|| format!("field '{id}' expects a point {{cx,cy}} or [x,y]"))?;
+                    parse_point(value).ok_or_else(|| format!("field '{id}' expects a point {{cx,cy}} or [x,y]"))?;
                 let s = format!("{cx},{cy}");
-                (json!({ "cx": cx, "cy": cy }), wrap("V_String", json!(s)))
+                (json!({ "cx": cx, "cy": cy }), wrap("V_String", &json!(s)))
             }
-            FieldKind::EntityRef => {
-                let iid = v
-                    .as_str()
-                    .map(String::from)
-                    .or_else(|| v.get("entityIid").and_then(Value::as_str).map(String::from))
-                    .ok_or_else(|| format!("field '{id}' expects an entity iid string"))?;
-                let info = self
-                    .resolve_entity_ref(&iid)
-                    .ok_or_else(|| format!("field '{id}': entity ref '{iid}' not found in project"))?;
-                (
-                    json!({
-                        "entityIid": iid,
-                        "layerIid": info.layer_iid,
-                        "levelIid": info.level_iid,
-                        "worldIid": info.world_iid,
-                    }),
-                    wrap("V_String", json!(iid)),
-                )
-            }
+            FieldKind::EntityRef => self.encode_entity_ref(id, value)?,
             FieldKind::Tile => {
                 let (x, y, w, h) =
-                    parse_tile_rect(v).ok_or_else(|| format!("field '{id}' expects a tile rect {{x,y,w,h}}"))?;
-                let tileset_uid = v.get("tilesetUid").and_then(Value::as_i64).or(def.tileset_uid);
+                    parse_tile_rect(value).ok_or_else(|| format!("field '{id}' expects a tile rect {{x,y,w,h}}"))?;
+                let tileset_uid = value.get("tilesetUid").and_then(Value::as_i64).or(def.tileset_uid);
                 let s = format!("{x},{y},{w},{h}");
                 (
                     json!({ "tilesetUid": tileset_uid, "x": x, "y": y, "w": w, "h": h }),
-                    wrap("V_String", json!(s)),
+                    wrap("V_String", &json!(s)),
                 )
             }
         })
@@ -390,7 +411,7 @@ mod tests {
         assert_eq!(int_to_hex(0xFF_8000), "#FF8000");
         assert_eq!(int_to_hex(0), "#000000");
         // High bits beyond 24 are masked off.
-        assert_eq!(int_to_hex(0xABFF_8000_u32 as i64), "#FF8000");
+        assert_eq!(int_to_hex(i64::from(0xABFF_8000_u32)), "#FF8000");
     }
 
     #[test]
@@ -587,9 +608,9 @@ mod tests {
             }],
         }));
         let info = p.resolve_entity_ref("ent-1").expect("ref resolved");
-        assert_eq!(info.world_iid, "world-1");
-        assert_eq!(info.level_iid, "level-1");
-        assert_eq!(info.layer_iid, "layer-1");
+        assert_eq!(info.world, "world-1");
+        assert_eq!(info.level, "level-1");
+        assert_eq!(info.layer, "layer-1");
         assert!(p.resolve_entity_ref("missing").is_none());
     }
 
