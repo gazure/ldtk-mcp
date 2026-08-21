@@ -8,14 +8,18 @@ The server operates directly on the `.ldtk` JSON file, in the format documented 
 `JSON_SCHEMA.json` (currently v1.5.3). It does **not** drive the LDtk GUI. After the agent edits
 and saves, reload the project in LDtk to see the changes.
 
-## Build
+## Install
 
 ```bash
-cargo build --release
-# binary at target/release/ldtk-mcp
+cargo install --git https://github.com/gazure/ldtk-mcp
 ```
 
-Building requires a recent stable Rust toolchain.
+Installing requires a recent stable Rust toolchain. The crate isn't on crates.io yet, so install
+it from Git rather than by name. To install from a clone you're editing, run `cargo install
+--path .` from the repository root.
+
+Either form puts a release binary at `~/.cargo/bin/ldtk-mcp`, which a standard rustup setup
+already has on your `PATH`.
 
 ## Register with an MCP client
 
@@ -24,7 +28,7 @@ The server speaks JSON-RPC over stdio, so any MCP client can launch it as a subp
 For Claude Code:
 
 ```bash
-claude mcp add ldtk /absolute/path/to/ldtk-mcp/target/release/ldtk-mcp
+claude mcp add ldtk ldtk-mcp
 ```
 
 For Cursor, add the server to `~/.cursor/mcp.json` or to a project `.cursor/mcp.json`:
@@ -33,11 +37,15 @@ For Cursor, add the server to `~/.cursor/mcp.json` or to a project `.cursor/mcp.
 {
   "mcpServers": {
     "ldtk": {
-      "command": "/absolute/path/to/ldtk-mcp/target/release/ldtk-mcp"
+      "command": "ldtk-mcp"
     }
   }
 }
 ```
+
+If your client reports that the command isn't found, give it the absolute path
+(`~/.cargo/bin/ldtk-mcp`, expanded). Clients launched from the desktop rather than a shell don't
+always inherit the `PATH` your terminal has.
 
 ## Recommended workflow
 
