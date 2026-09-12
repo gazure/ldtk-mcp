@@ -131,7 +131,12 @@ colored box. Output caps at roughly 1024px on the longest edge by default; overr
 `scale` or `max_px`. When you pass the `layers` argument, the renderer draws only those layers.
 
 Tilesets whose image can't be decoded, such as `.aseprite` files and embedded atlases, render as a
-magenta placeholder and appear in the tool's text note. A render never fails outright.
+magenta placeholder and appear in the tool's text note.
+
+Each source or output canvas is limited to 64 MiB of RGBA pixels (for example, 4096 × 4096).
+Larger renders return an error before allocating the canvases. Lowering `scale` or `max_px`
+reduces the output size, but the source level must also fit the limit. This limit covers canvas
+buffers, not total rendering memory, which also includes tileset images and PNG encoding.
 
 Note: the editing tools clear `autoLayerTiles` so that LDtk regenerates them on load. A
 freshly-edited IntGrid therefore previews as its **value colors**, not as the generated tiles,

@@ -4,7 +4,7 @@
 //! actually see the result. Layers are drawn bottom-to-top — `IntGrid` cells as their value
 //! colors, tile/auto layers as real pixels sampled from the decoded tileset images, and
 //! entities as their tile sprite or a colored box. Tilesets that can't be decoded
-//! (`.aseprite`, embedded) render as a magenta placeholder so a render never fails outright.
+//! (`.aseprite`, embedded) render as a magenta placeholder.
 
 // The blit/draw helpers are inherently many-parameter (rect geometry + flip + opacity); a context
 // struct would obscure more than it clarifies for this internal module. Their x/y/w/h/c names are
@@ -69,13 +69,27 @@ struct Canvas {
     px: Vec<u8>,
 }
 
+const MAX_CANVAS_BYTES: usize = 64 * 1024 * 1024;
+
+fn canvas_bytes(w: u32, h: u32) -> Result<usize> {
+    let bytes = u64::from(w)
+        .checked_mul(u64::from(h))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|&bytes| bytes <= MAX_CANVAS_BYTES as u64)
+        .ok_or_else(|| anyhow!("render canvas {w}x{h} exceeds the 64 MiB limit"))?;
+    Ok(usize::try_from(bytes)?)
+}
+
 impl Canvas {
-    fn new(w: u32, h: u32, bg: [u8; 4]) -> Self {
-        let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
+    fn new(w: u32, h: u32, bg: [u8; 4]) -> Result<Self> {
+        let bytes = canvas_bytes(w, h)?;
+        let mut px = Vec::new();
+        px.try_reserve_exact(bytes)?;
+        px.resize(bytes, 0);
         for chunk in px.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&bg);
         }
-        Self { w, h, px }
+        Ok(Self { w, h, px })
     }
 
     /// Alpha-composite `c` over the pixel at `(x, y)` (out-of-bounds is a no-op).
@@ -378,12 +392,8 @@ fn output_dims(w: u32, h: u32, opts: &RenderOpts) -> (u32, u32, f64) {
     (ow, oh, scale)
 }
 
-fn resample(src: &Canvas, ow: u32, oh: u32) -> Canvas {
-    let mut out = Canvas {
-        w: ow,
-        h: oh,
-        px: vec![0u8; (ow as usize) * (oh as usize) * 4],
-    };
+fn resample(src: &Canvas, ow: u32, oh: u32) -> Result<Canvas> {
+    let mut out = Canvas::new(ow, oh, [0; 4])?;
     for oy in 0..oh {
         let sy = (u64::from(oy) * u64::from(src.h) / u64::from(oh)) as u32;
         for ox in 0..ow {
@@ -393,7 +403,7 @@ fn resample(src: &Canvas, ow: u32, oh: u32) -> Canvas {
             out.px[di..di + 4].copy_from_slice(&src.px[si..si + 4]);
         }
     }
-    out
+    Ok(out)
 }
 
 fn encode_png(c: &Canvas) -> Result<Vec<u8>> {
@@ -418,7 +428,12 @@ pub fn render(p: &Project, r: LevelRef, opts: &RenderOpts) -> Result<RenderOutpu
         .and_then(Value::as_str)
         .map_or(DEFAULT_BG, hex_rgba);
 
-    let mut canvas = Canvas::new(px_wid as u32, px_hei as u32, bg);
+    let width = u32::try_from(px_wid).map_err(|_| anyhow!("render width {px_wid} exceeds the supported range"))?;
+    let height = u32::try_from(px_hei).map_err(|_| anyhow!("render height {px_hei} exceeds the supported range"))?;
+    canvas_bytes(width, height)?;
+    let (ow, oh, scale) = output_dims(width, height, opts);
+    canvas_bytes(ow, oh)?;
+    let mut canvas = Canvas::new(width, height, bg)?;
     let mut cache = TilesetCache::new(p);
 
     if let Some(layers) = level.get("layerInstances").and_then(Value::as_array) {
@@ -447,11 +462,10 @@ pub fn render(p: &Project, r: LevelRef, opts: &RenderOpts) -> Result<RenderOutpu
         }
     }
 
-    let (ow, oh, scale) = output_dims(canvas.w, canvas.h, opts);
     let final_canvas = if ow == canvas.w && oh == canvas.h {
         canvas
     } else {
-        resample(&canvas, ow, oh)
+        resample(&canvas, ow, oh)?
     };
     let png = encode_png(&final_canvas)?;
     Ok(RenderOutput {
@@ -490,6 +504,40 @@ mod tests {
     }
 
     #[test]
+    fn canvas_limit_checks_boundary_and_overflow() {
+        assert_eq!(canvas_bytes(4096, 4096).unwrap(), MAX_CANVAS_BYTES);
+        assert!(canvas_bytes(4096, 4097).is_err());
+        assert!(Canvas::new(u32::MAX, u32::MAX, [0; 4]).is_err());
+    }
+
+    #[test]
+    fn render_rejects_oversized_source_and_output() {
+        for (width, height, scale, max_px) in [
+            (10_000, 10_000, None, 1024),
+            (i64::MAX, 1, None, 1024),
+            (1, i64::MAX, None, 1024),
+            (32, 32, Some(1000.0), 1024),
+            (32, 32, None, i64::MAX),
+        ] {
+            let p = Project::from_root_for_test(json!({
+                "levels": [{"identifier": "L", "pxWid": width, "pxHei": height}]
+            }));
+            let error = render_level(
+                &p,
+                "L",
+                &RenderOpts {
+                    scale,
+                    max_px,
+                    layers: None,
+                },
+            )
+            .err()
+            .expect("oversized render must fail");
+            assert!(error.to_string().contains("exceeds"), "{error}");
+        }
+    }
+
+    #[test]
     fn hex_rgba_parses_and_defaults() {
         assert_eq!(hex_rgba("#FF8000"), [0xFF, 0x80, 0x00, 0xFF]);
         assert_eq!(hex_rgba("zzz"), [0, 0, 0, 0xFF]);
@@ -506,25 +554,25 @@ mod tests {
                 0, 0, 255, 255, 255, 255, 255, 255, // row 1
             ],
         };
-        let mut c = Canvas::new(2, 2, [0, 0, 0, 255]);
+        let mut c = Canvas::new(2, 2, [0, 0, 0, 255]).unwrap();
         blit(&mut c, &src, 0, 0, 2, 2, 0, 0, 2, 2, 0, 1.0);
         assert_eq!(px(&c.px, 2, 0, 0), [255, 0, 0, 255], "no-flip TL");
         assert_eq!(px(&c.px, 2, 1, 0), [0, 255, 0, 255], "no-flip TR");
 
         // flip X: TL should now show the source's TR (green).
-        let mut fx = Canvas::new(2, 2, [0, 0, 0, 255]);
+        let mut fx = Canvas::new(2, 2, [0, 0, 0, 255]).unwrap();
         blit(&mut fx, &src, 0, 0, 2, 2, 0, 0, 2, 2, 1, 1.0);
         assert_eq!(px(&fx.px, 2, 0, 0), [0, 255, 0, 255], "flipX TL");
 
         // flip Y: TL should show the source's BL (blue).
-        let mut fy = Canvas::new(2, 2, [0, 0, 0, 255]);
+        let mut fy = Canvas::new(2, 2, [0, 0, 0, 255]).unwrap();
         blit(&mut fy, &src, 0, 0, 2, 2, 0, 0, 2, 2, 2, 1.0);
         assert_eq!(px(&fy.px, 2, 0, 0), [0, 0, 255, 255], "flipY TL");
     }
 
     #[test]
     fn blend_alpha_composites() {
-        let mut c = Canvas::new(1, 1, [0, 0, 0, 255]);
+        let mut c = Canvas::new(1, 1, [0, 0, 0, 255]).unwrap();
         c.blend(0, 0, [255, 255, 255, 128]);
         let got = px(&c.px, 1, 0, 0);
         // ~50% white over black.
