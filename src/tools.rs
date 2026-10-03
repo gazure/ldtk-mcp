@@ -39,9 +39,26 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
+const MAX_READ_BYTES: usize = 65_536;
+const MAX_GRID_ITEMS: usize = 4096;
+
+/// Serializes a read response compactly, or reports how to narrow an oversized query.
+fn bounded_read(v: &Value, advice: &str) -> Result<String, ErrorData> {
+    let text = v.to_string();
+    if text.len() > MAX_READ_BYTES {
+        return Err(err(format!("read exceeds {MAX_READ_BYTES} bytes; {advice}")));
+    }
+    Ok(text)
+}
+
 /// Compact, agent-friendly view of an entity instance: grid coords, size, tags, and a
 /// `fields` map of `__identifier` -> `__value` folded from `fieldInstances`.
 fn entity_summary(e: &Value) -> Value {
+    entity_summary_with_fields(e, None)
+}
+
+/// Summarizes an entity, decoding only the requested custom fields when a selection is provided.
+fn entity_summary_with_fields(e: &Value, selected: Option<&[String]>) -> Value {
     let grid = e.get("__grid").and_then(Value::as_array);
     let cx = grid.and_then(|g| g.first()).and_then(Value::as_i64);
     let cy = grid.and_then(|g| g.get(1)).and_then(Value::as_i64);
@@ -49,7 +66,9 @@ fn entity_summary(e: &Value) -> Value {
     if let Some(fis) = e.get("fieldInstances").and_then(Value::as_array) {
         for fi in fis {
             if let Some(id) = fi.get("__identifier").and_then(Value::as_str) {
-                fields.insert(id.to_string(), fi.get("__value").cloned().unwrap_or(Value::Null));
+                if selected.is_none_or(|names| names.iter().any(|name| name == id)) {
+                    fields.insert(id.to_string(), fi.get("__value").cloned().unwrap_or(Value::Null));
+                }
             }
         }
     }
@@ -210,10 +229,32 @@ pub struct PaintTilesArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct GridRect {
+    /// Left grid column, inclusive.
     pub cx: i64,
+    /// Top grid row, inclusive.
     pub cy: i64,
+    /// Width in cells; must be positive for reads.
     pub w: i64,
+    /// Height in cells; must be positive for reads.
     pub h: i64,
+}
+
+impl GridRect {
+    /// Returns exclusive right and bottom edges, or an error for invalid dimensions or overflow.
+    fn read_bounds(&self) -> Result<(i64, i64), ErrorData> {
+        if self.w <= 0 || self.h <= 0 {
+            return Err(err("rect width and height must be positive"));
+        }
+        let right = self
+            .cx
+            .checked_add(self.w)
+            .ok_or_else(|| err("rect X bounds overflow"))?;
+        let bottom = self
+            .cy
+            .checked_add(self.h)
+            .ok_or_else(|| err("rect Y bounds overflow"))?;
+        Ok((right, bottom))
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -242,6 +283,31 @@ pub struct GetEntitiesArgs {
     pub level: String,
     /// Optional Entity layer identifier or iid. If omitted, scans all Entity layers.
     pub layer: Option<String>,
+    /// Filter by exact entity definition identifier.
+    pub identifier: Option<String>,
+    /// Require all listed tags. An empty list matches every entity.
+    pub tags: Option<Vec<String>>,
+    /// Match entity anchor cells inside this rectangle, in each layer's grid coordinates.
+    pub rect: Option<GridRect>,
+    /// Matching entities to skip across all selected layers. Default 0.
+    pub offset: Option<usize>,
+    /// Maximum entities to return across all selected layers, from 1 to 500. Default 100.
+    pub limit: Option<usize>,
+    /// Field identifiers to include. Omit for all fields; use [] for no fields.
+    pub fields: Option<Vec<String>>,
+}
+
+/// Output representations for a selected `IntGrid` region.
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IntGridEncoding {
+    /// Row-major integer cells.
+    #[default]
+    Csv,
+    /// Row-major [value, count] runs, which can span rows.
+    Rle,
+    /// Nonzero [cx, cy, value] cells in absolute layer coordinates; omitted cells are zero.
+    Sparse,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -250,6 +316,10 @@ pub struct GetIntGridArgs {
     pub level: String,
     /// `IntGrid` layer identifier or iid.
     pub layer: String,
+    /// Optional grid rectangle, fully inside the layer. Omit for the whole layer.
+    pub rect: Option<GridRect>,
+    /// Output encoding: csv (default), rle, or sparse. At most 4096 cells, runs, or entries.
+    pub encoding: Option<IntGridEncoding>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -483,6 +553,135 @@ pub struct RenderLevelArgs {
     pub layers: Option<Vec<String>>,
 }
 
+/// Returns a filtered entity page in layer and instance order, or an error for invalid bounds.
+fn entity_page(layers: &[&Value], args: &GetEntitiesArgs) -> Result<Value, ErrorData> {
+    let offset = args.offset.unwrap_or(0);
+    let limit = args.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return Err(err("limit must be between 1 and 500"));
+    }
+    let bounds = args.rect.as_ref().map(GridRect::read_bounds).transpose()?;
+    let mut total = 0;
+    let mut returned = 0;
+    let mut result = Vec::new();
+    for li in layers {
+        let mut entities = Vec::new();
+        for e in li
+            .get("entityInstances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if args
+                .identifier
+                .as_ref()
+                .is_some_and(|id| e["__identifier"].as_str() != Some(id))
+            {
+                continue;
+            }
+            if args.tags.as_ref().is_some_and(|tags| {
+                !tags.iter().all(|tag| {
+                    e["__tags"]
+                        .as_array()
+                        .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(tag)))
+                })
+            }) {
+                continue;
+            }
+            if let (Some(rect), Some((right, bottom))) = (&args.rect, bounds) {
+                let inside = e["__grid"][0]
+                    .as_i64()
+                    .zip(e["__grid"][1].as_i64())
+                    .is_some_and(|(x, y)| x >= rect.cx && x < right && y >= rect.cy && y < bottom);
+                if !inside {
+                    continue;
+                }
+            }
+            if total >= offset && returned < limit {
+                entities.push(entity_summary_with_fields(e, args.fields.as_deref()));
+                returned += 1;
+            }
+            total += 1;
+        }
+        if !entities.is_empty() {
+            result.push(json!({ "layer": li.get("__identifier"), "entities": entities }));
+        }
+    }
+    let next = offset.saturating_add(returned);
+    Ok(json!({
+        "layers": result, "total": total, "offset": offset, "limit": limit,
+        "returned": returned, "next_offset": if next < total { Some(next) } else { None },
+    }))
+}
+
+/// Encodes a grid region, rejecting invalid geometry, malformed grids, or oversized output.
+fn intgrid_region(li: &Value, args: &GetIntGridArgs) -> Result<Value, ErrorData> {
+    let width = li["__cWid"].as_i64().unwrap_or(0);
+    let height = li["__cHei"].as_i64().unwrap_or(0);
+    let total = width.checked_mul(height).and_then(|v| usize::try_from(v).ok());
+    let csv = li["intGridCsv"]
+        .as_array()
+        .ok_or_else(|| err("layer has no intGridCsv array"))?;
+    if width <= 0 || height <= 0 || total != Some(csv.len()) {
+        return Err(err("IntGrid dimensions do not match its cell array"));
+    }
+    let full = GridRect {
+        cx: 0,
+        cy: 0,
+        w: width,
+        h: height,
+    };
+    let rect = args.rect.as_ref().unwrap_or(&full);
+    let (right, bottom) = rect.read_bounds()?;
+    if rect.cx < 0 || rect.cy < 0 || right > width || bottom > height {
+        return Err(err(format!("rect must fit inside the {width}x{height} layer")));
+    }
+    let encoding = args.encoding.as_ref().unwrap_or(&IntGridEncoding::Csv);
+    let (name, key) = match encoding {
+        IntGridEncoding::Csv => ("csv", "csv"),
+        IntGridEncoding::Rle => ("rle", "runs"),
+        IntGridEncoding::Sparse => ("sparse", "cells"),
+    };
+    let mut data = Vec::new();
+    let mut run: Option<(i64, usize)> = None;
+    for y in rect.cy..bottom {
+        for x in rect.cx..right {
+            let value = csv[(y * width + x) as usize]
+                .as_i64()
+                .ok_or_else(|| err("IntGrid contains a non-integer cell"))?;
+            match encoding {
+                IntGridEncoding::Csv => data.push(json!(value)),
+                IntGridEncoding::Sparse if value != 0 => data.push(json!([x, y, value])),
+                IntGridEncoding::Sparse => {}
+                IntGridEncoding::Rle => match run {
+                    Some((previous, count)) if previous == value => run = Some((value, count + 1)),
+                    previous => {
+                        if let Some((value, count)) = previous {
+                            data.push(json!([value, count]));
+                        }
+                        run = Some((value, 1));
+                    }
+                },
+            }
+            if data.len() + usize::from(run.is_some()) > MAX_GRID_ITEMS {
+                return Err(err(format!(
+                    "IntGrid read exceeds {MAX_GRID_ITEMS} {name} items; request a smaller rect or use encoding rle/sparse"
+                )));
+            }
+        }
+    }
+    if let Some((value, count)) = run {
+        data.push(json!([value, count]));
+    }
+    let mut payload = json!({
+        "identifier": li.get("__identifier"), "gridSize": li.get("__gridSize"),
+        "cx": rect.cx, "cy": rect.cy, "cWid": rect.w, "cHei": rect.h,
+        "layerCWid": width, "layerCHei": height, "encoding": name,
+    });
+    payload[key] = json!(data);
+    Ok(payload)
+}
+
 // ---- Tool implementations --------------------------------------------------
 
 #[tool_router]
@@ -689,7 +888,7 @@ impl LdtkServer {
     }
 
     #[tool(
-        description = "Read the full content of a single layer instance: IntGrid CSV, grid tiles, or entities (with decoded fields), plus dimensions. AutoLayer tiles are counted unless include_auto_tiles is true."
+        description = "Read a small layer's content and dimensions (64 KiB response cap). Prefer get_intgrid for regions/compact grids and get_entities for filtered pages. AutoLayer tiles are counted unless include_auto_tiles is true."
     )]
     fn get_layer(&self, Parameters(args): Parameters<GetLayerArgs>) -> Result<String, ErrorData> {
         self.with_project(|p| {
@@ -700,6 +899,21 @@ impl LdtkServer {
                 .layer_instance_ref(idx, &args.layer)
                 .ok_or_else(|| err(format!("layer '{}' not found in level", args.layer)))?;
             let kind = li.get("__type").and_then(Value::as_str).unwrap_or("");
+            let advice = "use get_intgrid with rect/encoding, get_entities with filters/limit, or get_level/render_level for an overview";
+            let content_key = match kind {
+                "IntGrid" => "intGridCsv",
+                "Tiles" => "gridTiles",
+                "Entities" => "entityInstances",
+                _ => "autoLayerTiles",
+            };
+            for key in [content_key, "autoLayerTiles"] {
+                if key == "autoLayerTiles" && !args.include_auto_tiles.unwrap_or(false) {
+                    continue;
+                }
+                if li.get(key).and_then(Value::as_array).is_some_and(|items| items.len() > MAX_GRID_ITEMS) {
+                    return Err(err(format!("layer content exceeds {MAX_GRID_ITEMS} items; {advice}")));
+                }
+            }
             let mut out = json!({
                 "identifier": li.get("__identifier"),
                 "type": li.get("__type"),
@@ -736,12 +950,12 @@ impl LdtkServer {
             } else {
                 obj.insert("autoLayerTileCount".into(), json!(auto.map_or(0, std::vec::Vec::len)));
             }
-            Ok(pretty(&out))
+            bounded_read(&out, advice)
         })
     }
 
     #[tool(
-        description = "List entity instances on a level with their iid, grid position, size, tags, and decoded field values. If `layer` is omitted, scans all Entity layers."
+        description = "Read entity pages with optional identifier, all-tags, and grid-rect filters. Returns layers, total matching count, and next_offset (null at end). Default limit 100, max 500; fields selects custom fields ([] omits them). Repeat with the same filters and next_offset; edits can shift pages."
     )]
     fn get_entities(&self, Parameters(args): Parameters<GetEntitiesArgs>) -> Result<String, ErrorData> {
         self.with_project(|p| {
@@ -760,22 +974,15 @@ impl LdtkServer {
                 }
                 None => p.entity_layer_instances(idx),
             };
-            let mut result = Vec::new();
-            for li in layers {
-                let layer_id = li.get("__identifier").and_then(Value::as_str).unwrap_or("");
-                let entities: Vec<Value> = li
-                    .get("entityInstances")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().map(entity_summary).collect())
-                    .unwrap_or_default();
-                result.push(json!({ "layer": layer_id, "entities": entities }));
-            }
-            Ok(pretty(&json!(result)))
+            bounded_read(
+                &entity_page(&layers, &args)?,
+                "reduce limit or select fewer fields (fields: [])",
+            )
         })
     }
 
     #[tool(
-        description = "Read an IntGrid layer: dimensions, the row-major `csv` (same shape set_intgrid accepts), and the value definitions (number -> identifier/color)."
+        description = "Read an IntGrid region and value definitions. rect defaults to the whole layer. encoding: csv (default), rle ([value,count] runs across rows), or sparse (nonzero [cx,cy,value] in layer coordinates). Returns origin and region/layer dimensions. Max 4096 items and 64 KiB; narrow rect or change encoding if oversized."
     )]
     fn get_intgrid(&self, Parameters(args): Parameters<GetIntGridArgs>) -> Result<String, ErrorData> {
         self.with_project(|p| {
@@ -793,15 +1000,9 @@ impl LdtkServer {
                 .and_then(Value::as_str)
                 .unwrap_or(&args.layer)
                 .to_string();
-            let payload = json!({
-                "identifier": li.get("__identifier"),
-                "cWid": li.get("__cWid"),
-                "cHei": li.get("__cHei"),
-                "gridSize": li.get("__gridSize"),
-                "csv": li.get("intGridCsv").cloned().unwrap_or(json!([])),
-                "values": p.intgrid_value_defs(&layer_id),
-            });
-            Ok(pretty(&payload))
+            let mut payload = intgrid_region(li, &args)?;
+            payload["values"] = json!(p.intgrid_value_defs(&layer_id));
+            bounded_read(&payload, "request a smaller rect or use encoding rle/sparse")
         })
     }
 
@@ -1836,5 +2037,133 @@ mod tests {
         let s = entity_summary(&e);
         assert_eq!(s.get("cx").cloned(), Some(Value::Null));
         assert_eq!(s["fields"], json!({}));
+    }
+
+    fn grid_args(mut extra: Value) -> GetIntGridArgs {
+        extra["level"] = json!("Test");
+        extra["layer"] = json!("Terrain");
+        serde_json::from_value(extra).unwrap()
+    }
+
+    #[test]
+    fn grid_region_encodings_reconstruct_the_same_cells() {
+        let layer = json!({"__cWid": 4, "__cHei": 3, "intGridCsv": [9,9,9,9,9,0,2,9,9,2,2,9]});
+        let rect = json!({"cx": 1, "cy": 1, "w": 2, "h": 2});
+        let csv = intgrid_region(&layer, &grid_args(json!({"rect": rect}))).unwrap();
+        assert_eq!(csv["csv"], json!([0, 2, 2, 2]));
+        assert_eq!((csv["cx"].as_i64(), csv["cy"].as_i64()), (Some(1), Some(1)));
+        assert_eq!((csv["cWid"].as_i64(), csv["layerCWid"].as_i64()), (Some(2), Some(4)));
+        let rle = intgrid_region(&layer, &grid_args(json!({"rect": rect, "encoding": "rle"}))).unwrap();
+        assert_eq!(rle["runs"], json!([[0, 1], [2, 3]]));
+        let sparse = intgrid_region(&layer, &grid_args(json!({"rect": rect, "encoding": "sparse"}))).unwrap();
+        assert_eq!(sparse["cells"], json!([[2, 1, 2], [1, 2, 2], [2, 2, 2]]));
+    }
+
+    #[test]
+    fn grid_budget_applies_to_encoded_items() {
+        let mut layer = json!({"__cWid": 100, "__cHei": 100, "intGridCsv": vec![0; 10_000]});
+        assert!(intgrid_region(&layer, &grid_args(json!({}))).is_err());
+        let rle = intgrid_region(&layer, &grid_args(json!({"encoding": "rle"}))).unwrap();
+        assert_eq!(rle["runs"], json!([[0, 10_000]]));
+        let sparse = intgrid_region(&layer, &grid_args(json!({"encoding": "sparse"}))).unwrap();
+        assert_eq!(sparse["cells"], json!([]));
+        layer["intGridCsv"] = json!((0..10_000).map(|i| i % 2 + 1).collect::<Vec<_>>());
+        for encoding in ["rle", "sparse"] {
+            assert!(intgrid_region(&layer, &grid_args(json!({"encoding": encoding}))).is_err());
+        }
+        layer = json!({"__cWid": 4096, "__cHei": 1, "intGridCsv": vec![1; 4096]});
+        assert_eq!(
+            intgrid_region(&layer, &grid_args(json!({}))).unwrap()["csv"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4096
+        );
+    }
+
+    #[test]
+    fn grid_queries_reject_invalid_regions_and_malformed_cells() {
+        let mut layer = json!({"__cWid": 2, "__cHei": 2, "intGridCsv": [0,1,2,3]});
+        for rect in [
+            json!({"cx": -1, "cy": 0, "w": 1, "h": 1}),
+            json!({"cx": 0, "cy": 0, "w": 0, "h": 1}),
+            json!({"cx": 1, "cy": 1, "w": 2, "h": 1}),
+            json!({"cx": i64::MAX, "cy": 0, "w": 1, "h": 1}),
+        ] {
+            assert!(intgrid_region(&layer, &grid_args(json!({"rect": rect}))).is_err());
+        }
+        layer["intGridCsv"] = json!([0]);
+        assert!(intgrid_region(&layer, &grid_args(json!({}))).is_err());
+        layer["intGridCsv"] = json!([0, 1, null, 3]);
+        assert!(intgrid_region(&layer, &grid_args(json!({}))).is_err());
+        assert!(
+            serde_json::from_value::<GetIntGridArgs>(json!({"level":"L", "layer":"G", "encoding":"unknown"})).is_err()
+        );
+    }
+
+    fn entity_args(mut extra: Value) -> GetEntitiesArgs {
+        extra["level"] = json!("Test");
+        serde_json::from_value(extra).unwrap()
+    }
+
+    #[test]
+    fn entity_filters_combine_before_paging_across_layers() {
+        let first = json!({"__identifier": "A", "entityInstances": [
+            {"iid":"1", "__identifier":"Chest", "__grid":[1,1], "__tags":["loot","rare"],
+             "fieldInstances":[{"__identifier":"gold","__value":10},{"__identifier":"secret","__value":"x"}]},
+            {"iid":"2", "__identifier":"Chest", "__grid":[2,1], "__tags":["loot"]},
+            {"iid":"3", "__identifier":"Mob", "__grid":[1,1], "__tags":["loot","rare"]}
+        ]});
+        let second = json!({"__identifier": "B", "entityInstances": [
+            {"iid":"4", "__identifier":"Chest", "__grid":[2,2], "__tags":["loot","rare"]},
+            {"iid":"5", "__identifier":"Chest", "__grid":[3,1], "__tags":["loot","rare"]},
+            {"iid":"6", "__identifier":"Chest", "__grid":[1,3], "__tags":["loot","rare"]}
+        ]});
+        let mut options = json!({"identifier":"Chest", "tags":["loot","rare"],
+            "rect":{"cx":1,"cy":1,"w":2,"h":2}, "limit":1,"fields":["gold"]});
+        let page = entity_page(&[&first, &second], &entity_args(options.clone())).unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["returned"], 1);
+        assert_eq!(page["next_offset"], 1);
+        assert_eq!(page["layers"][0]["entities"][0]["iid"], "1");
+        assert_eq!(page["layers"][0]["entities"][0]["fields"], json!({"gold":10}));
+        options["offset"] = page["next_offset"].clone();
+        let page = entity_page(&[&first, &second], &entity_args(options)).unwrap();
+        assert_eq!(page["layers"][0]["layer"], "B");
+        assert_eq!(page["layers"][0]["entities"][0]["iid"], "4");
+        assert!(page["next_offset"].is_null());
+    }
+
+    #[test]
+    fn entity_pagination_defaults_and_empty_pages_are_bounded() {
+        let entities: Vec<Value> = (0..105)
+            .map(|i| json!({"iid":i.to_string(),"fieldInstances":[{"__identifier":"x","__value":1}]}))
+            .collect();
+        let layer = json!({"__identifier":"A", "entityInstances":entities});
+        let page = entity_page(&[&layer], &entity_args(json!({"fields":[]}))).unwrap();
+        assert_eq!(page["returned"], 100);
+        assert_eq!(page["next_offset"], 100);
+        assert_eq!(page["layers"][0]["entities"][0]["fields"], json!({}));
+        let page = entity_page(&[&layer], &entity_args(json!({"offset":100}))).unwrap();
+        assert_eq!(page["returned"], 5);
+        assert!(page["next_offset"].is_null());
+        for options in [json!({"offset":usize::MAX}), json!({"identifier":"missing"})] {
+            let page = entity_page(&[&layer], &entity_args(options)).unwrap();
+            assert_eq!(page["layers"], json!([]));
+            assert!(page["next_offset"].is_null());
+        }
+        for options in [
+            json!({"limit":0}),
+            json!({"limit":501}),
+            json!({"rect":{"cx":0,"cy":0,"w":-1,"h":1}}),
+        ] {
+            assert!(entity_page(&[&layer], &entity_args(options)).is_err());
+        }
+    }
+
+    #[test]
+    fn read_byte_budget_rejects_large_field_values() {
+        assert!(bounded_read(&json!({"text":"x".repeat(MAX_READ_BYTES)}), "select fewer fields").is_err());
+        assert_eq!(bounded_read(&json!({"a":[0,1]}), "").unwrap(), "{\"a\":[0,1]}");
     }
 }
