@@ -2009,7 +2009,7 @@ mod tests {
         assert_eq!(vals.len(), 2);
         assert_eq!(vals[0].get("identifier").and_then(Value::as_str), Some("wall"));
         assert_eq!(vals[1].get("value").and_then(Value::as_i64), Some(2));
-        assert!(p.intgrid_value_defs("Nope").is_empty());
+        assert_eq!(p.intgrid_value_defs("Nope"), Vec::<Value>::new());
     }
 
     #[test]
@@ -2465,7 +2465,7 @@ mod tests {
         assert_eq!(vals.len(), 2);
         assert_eq!(vals[0].get("id").and_then(Value::as_str), Some("North"));
         assert_eq!(vals[0].get("color").and_then(Value::as_i64), Some(0));
-        assert!(def.get("tags").and_then(Value::as_array).unwrap().is_empty());
+        assert_eq!(def.get("tags").and_then(Value::as_array).unwrap(), &Vec::<Value>::new());
         assert!(p.create_enum("Direction", &[]).is_err());
     }
 
@@ -2571,8 +2571,8 @@ mod tests {
         // A new commit clears any pending redo branch.
         p.root = json!({ "n": 999 });
         p.undo().unwrap();
-        assert!(!p.redo_stack.is_empty());
+        assert_ne!(p.redo_stack, Vec::<Value>::new());
         p.commit_undo(p.root.clone());
-        assert!(p.redo_stack.is_empty());
+        assert_eq!(p.redo_stack, Vec::<Value>::new());
     }
 }
