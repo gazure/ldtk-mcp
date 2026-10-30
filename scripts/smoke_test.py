@@ -94,6 +94,7 @@ class Session:
     def close(self):
         self.proc.stdin.close()
         self.proc.wait(timeout=5)
+        self.proc.stdout.close()
 
 
 def workdir():
@@ -153,7 +154,7 @@ def test_typed_entity_fields():
         )
         check("get_entities runs", status == "OK", listing)
         if status == "OK":
-            data = json.loads(listing)
+            data = json.loads(listing)["layers"]
             ents = [e for grp in data for e in grp["entities"]]
             chest = next(
                 (
@@ -184,7 +185,7 @@ def test_typed_entity_fields():
         st, listing = s.call("get_entities", {"level": level, "layer": "GameEntities"})
         tmp = None
         if st == "OK":
-            ents = [e for grp in json.loads(listing) for e in grp["entities"]]
+            ents = [e for grp in json.loads(listing)["layers"] for e in grp["entities"]]
             tmp = next((e for e in ents if e["cx"] == 1 and e["cy"] == 1), None)
         if tmp and tmp.get("iid"):
             iid = tmp["iid"]
@@ -710,7 +711,7 @@ def test_define_from_scratch():
         check("place_entities w/ new entity+field", st == "OK", msg)
         st, listing = s.call("get_entities", {"level": "T3_Level", "layer": ent_layer})
         if st == "OK":
-            ents = [e for grp in json.loads(listing) for e in grp["entities"]]
+            ents = [e for grp in json.loads(listing)["layers"] for e in grp["entities"]]
             pickup = next((e for e in ents if e["identifier"] == "T3_Pickup"), None)
             check(
                 "placed entity decodes enum field",

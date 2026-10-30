@@ -65,9 +65,9 @@ directly. LDtk renders the tiles from the rules automatically on load.
 | `list_levels` | List levels with world position and size, across all worlds. |
 | `describe_defs` | Describe layers (including IntGrid values), entities (including fields), tilesets, and enums. Call before generating. |
 | `get_level` | Summarize a level and its layer instances, with content counts. |
-| `get_layer` | Return the full content of one layer instance: IntGrid CSV, grid tiles, or entities with decoded fields. |
-| `get_entities` | List entity instances on a level, for one layer or all, with iid, grid position, tags, and decoded field values. |
-| `get_intgrid` | Read an IntGrid layer: dimensions, the row-major `csv`, and value definitions that map each number to an identifier and color. |
+| `get_layer` | Read a small layer's content: IntGrid CSV, grid tiles, or entities with decoded fields. Large reads return an error with guidance. |
+| `get_entities` | Read a page of entities, filtered by layer, identifier, tags, or grid region, with optional field selection. |
+| `get_intgrid` | Read an IntGrid region as row-major cells, run-length encoding, or sparse cells, with dimensions and value definitions. |
 | `get_entity` | Fetch a single entity instance by iid, with a decoded `fields` map and the raw `fieldInstances`. |
 | `render_level` | Rasterize a level to a PNG — IntGrid colors, real tileset tiles, entities — and return it inline as an image. |
 | `create_level` | Append a new empty level, building layer instances from the project's layer defs. |
@@ -98,6 +98,64 @@ directly. LDtk renders the tiles from the rules automatically on load.
 | `undo` / `redo` | Step backward or forward through mutating edits, in memory, up to 20 steps. |
 | `revert_unsaved` | Discard all unsaved edits by reloading from disk. |
 | `save_project` | Write the in-memory project, and any `.ldtkl` files, back to disk. |
+
+### Selective reads
+
+Use `get_level` for content counts before reading a layer. `get_layer`, `get_entities`, and
+`get_intgrid` return compact JSON with a 64 KiB response limit. Oversized reads return an error
+that explains how to narrow the query; they never silently truncate content.
+
+`get_entities` returns up to 100 entities by default. Set `limit` to a value from 1 to 500.
+The limit applies across all selected layers. Combine these optional filters:
+
+- `layer`: Layer identifier or iid. Omit to search all entity layers.
+- `identifier`: Exact entity definition identifier, such as `Chest`.
+- `tags`: Tags that each returned entity must have. An empty array matches all tags.
+- `rect`: `{cx, cy, w, h}` in each layer's grid coordinates. The filter tests the entity's
+  anchor cell, with exclusive right and bottom edges. Width and height must be positive.
+- `fields`: Custom field identifiers to return. Omit for all fields, or use `[]` for none.
+
+For example, pass these arguments to `get_entities`:
+
+```json
+{"level":"Cave_01","identifier":"Chest","tags":["loot"],"limit":20,"fields":["content"]}
+```
+
+The response is an object with `layers`, `total`, `offset`, `limit`, `returned`, and `next_offset`.
+`layers` contains `{layer, entities}` groups for the current page. `total` counts all matching
+entities before pagination. To read the next page, pass `next_offset` as `offset` with the same
+filters. A null `next_offset` marks the end. Results follow project layer and entity order;
+edits between calls can shift pages. Layers with no entities in the page are omitted.
+
+**Response format change:** `get_entities` previously returned the groups as a top-level array.
+Clients must now read those groups from `response.layers` and follow pagination.
+
+`get_intgrid` accepts an optional `rect` fully inside the layer and an `encoding`:
+
+| Encoding | Response data | Meaning |
+| --- | --- | --- |
+| `csv` (default) | `csv: [value, ...]` | Row-major cells in the selected region. |
+| `rle` | `runs: [[value, count], ...]` | Row-major runs that can span rows within the selected region. |
+| `sparse` | `cells: [[cx, cy, value], ...]` | Nonzero cells in absolute layer coordinates. Omitted cells in the region are zero. |
+
+For example, pass these arguments to `get_intgrid`:
+
+```json
+{"level":"Cave_01","layer":"Collision","rect":{"cx":8,"cy":4,"w":16,"h":12},"encoding":"rle"}
+```
+
+The response includes the region origin (`cx`, `cy`), region dimensions (`cWid`, `cHei`), full
+layer dimensions (`layerCWid`, `layerCHei`), `gridSize`, and value definitions (`values`).
+Without `rect`, the region covers the full layer. Each read supports up to 4096 cells, runs,
+or sparse entries, depending on the encoding. For large uniform or mostly empty grids, use
+`rle` or `sparse`. If the encoded result is still too large, request smaller regions.
+
+`set_intgrid.csv` still replaces a **whole layer**. A cropped CSV or compact encoding is not
+a replacement payload; use `set_intgrid.rects` for rectangle edits.
+
+`get_layer` supports at most 4096 items per included content array, in addition to the byte
+limit. For large layers, use the selective reads, `get_level` for counts, or `render_level`
+for visual inspection. AutoLayer tiles count toward the limit only when requested.
 
 ### Typed fields
 
@@ -201,6 +259,7 @@ editing all work. Build the debug binary first, because the script runs `target/
 ```bash
 cargo build
 python3 scripts/smoke_test.py
+python3 scripts/read_queries_test.py
 ```
 
 Changes must pass both lint gates. Formatting uses nightly rustfmt, because `rustfmt.toml` sets
