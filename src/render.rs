@@ -611,7 +611,7 @@ mod tests {
         assert_eq!((w, h), (32, 32));
         assert_eq!(px(&buf, w, 0, 0), [255, 0, 0, 255], "wall cell red");
         assert_eq!(px(&buf, w, 20, 20), [0, 0, 0, 255], "empty cell bg");
-        assert!(out.warnings.is_empty());
+        assert_eq!(out.warnings, Vec::<String>::new());
     }
 
     #[test]
