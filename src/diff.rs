@@ -250,7 +250,7 @@ mod tests {
                          "layerInstances": [] }],
             "defs": { "layers": [], "entities": [], "enums": [], "tilesets": [] },
         });
-        assert!(summarize(&root, &root).is_empty());
+        assert_eq!(summarize(&root, &root), Vec::<String>::new());
     }
 
     #[test]
